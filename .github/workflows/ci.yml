@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Format, test, and check the Rust workspace
+        run: >-
+          docker run --rm
+          --volume "${{ github.workspace }}:/work"
+          --workdir /work/rust
+          rust:1.88-slim@sha256:38bc5a86d998772d4aec2348656ed21438d20fcdce2795b56ca434cf21430d89
+          bash -c 'apt-get update && apt-get install -y --no-install-recommends build-essential cmake perl pkg-config nodejs && rustup component add rustfmt && cargo fmt --all -- --check && cargo test --workspace --locked && cargo check --workspace --locked && cargo check --workspace --all-targets --locked'
+
+  plugins-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
+      - run: npm run check:plugin-sdk
+      - run: npm run check:licenses
+      - run: npm run check:public-boundary
+      - run: npm run check:git-history
+      - run: npm run build
+      - run: docker build -t drama-warden:ci .
+      - name: Smoke-test the default Docker image
+        run: sh scripts/smoke-default-image.sh drama-warden:ci

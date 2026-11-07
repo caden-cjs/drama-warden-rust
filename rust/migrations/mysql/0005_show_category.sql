@@ -1,0 +1,1 @@
+ALTER TABLE shows ADD COLUMN category VARCHAR(16) NOT NULL DEFAULT 'tv' AFTER media_type;

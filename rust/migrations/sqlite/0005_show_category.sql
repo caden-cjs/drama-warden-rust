@@ -1,0 +1,1 @@
+ALTER TABLE shows ADD COLUMN category TEXT NOT NULL DEFAULT 'tv';

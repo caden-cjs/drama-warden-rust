@@ -1,0 +1,37 @@
+{
+  "name": "drama-warden",
+  "version": "0.1.0",
+  "description": "追剧引擎：家庭媒体库追更与归档自动化",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/plugin-sdk"
+  ],
+  "engines": {
+    "node": ">=22.15"
+  },
+  "dependencies": {
+    "@drama-warden/plugin-sdk": "0.1.0"
+  },
+  "scripts": {
+    "start": "cargo run --locked --release --manifest-path rust/Cargo.toml -p drama-warden-server",
+    "cli": "node scripts/cli.mjs",
+    "dev": "vite --config vite.config.js",
+    "build": "vite build --config vite.config.js",
+    "mcp": "cargo run --locked --release --manifest-path rust/Cargo.toml -p drama-warden-server --bin mcp-bridge",
+    "test": "node --test backend/tests/*.test.mjs",
+    "check": "node --check scripts/cli.mjs && node --check backend/plugins/node-protocol-bridge.mjs && node --check packages/plugin-sdk/index.mjs && node --check scripts/check-public-boundary.mjs && node --check scripts/check-git-history.mjs && node --check scripts/check-npm-license-inventory.mjs",
+    "check:public-boundary": "node scripts/check-public-boundary.mjs",
+    "check:git-history": "node scripts/check-git-history.mjs",
+    "check:licenses": "node scripts/check-npm-license-inventory.mjs",
+    "check:plugin-sdk": "node scripts/check-plugin-sdk-package.mjs",
+    "update:license-inventory": "node scripts/check-npm-license-inventory.mjs --write-baseline"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.2.4",
+    "typescript": "7.0.2",
+    "typescript-5.0": "npm:typescript@5.0.4",
+    "vite": "^6.4.5",
+    "vue": "^3.5.44"
+  }
+}
