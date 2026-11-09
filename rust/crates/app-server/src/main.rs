@@ -965,7 +965,7 @@ async fn search_resources(
             "storage is disabled",
         );
     }
-    let limit = input.limit.unwrap_or(10).clamp(1, 20) as usize;
+    let limit = input.limit.unwrap_or(10).clamp(1, 100) as usize;
     if input.limit.is_some_and(|value| value < 1) {
         return api_error(
             StatusCode::BAD_REQUEST,
@@ -1312,7 +1312,7 @@ async fn run_automation_scan(
                         axum::Json(ResourceSearchRequest {
                             storage_id: storage.id,
                             query: None,
-                            limit: Some(5),
+                            limit: Some(100),
                         }),
                     )
                     .await;

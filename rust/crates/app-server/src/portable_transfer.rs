@@ -211,6 +211,14 @@ fn validate_snapshot(snapshot: &Value) -> Result<(i64, HashMap<&str, TableExport
     Ok((version, tables))
 }
 
+fn table_optional_for_schema(version: i64, table: &str) -> bool {
+    match table {
+        "plugin_call_log" => version < 4,
+        "plugin_configuration" | "plugin_config_audit" => version < 6,
+        _ => false,
+    }
+}
+
 async fn table_columns<'e, E>(executor: E, driver: &str, table: &str) -> Result<Vec<String>, String>
 where
     E: sqlx::Executor<'e, Database = Any>,
@@ -705,7 +713,7 @@ pub async fn import_file(
                     "database export schema does not match target table {table}"
                 ));
             }
-        } else if !(version < 4 && *table == "plugin_call_log") {
+        } else if !table_optional_for_schema(version, table) {
             return Err(format!("database export is missing required table {table}"));
         }
     }
@@ -782,7 +790,9 @@ pub async fn import_file(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_json_column, is_timestamp_column, mysql_tinyint_column};
+    use super::{
+        is_json_column, is_timestamp_column, mysql_tinyint_column, table_optional_for_schema,
+    };
 
     #[test]
     fn mysql_native_columns_with_nonportable_types_are_classified() {
@@ -794,5 +804,16 @@ mod tests {
         assert!(is_json_column("shows", "aliases_json"));
         assert!(is_json_column("application_setting", "value_json"));
         assert!(is_timestamp_column("shows", "created_at"));
+    }
+
+    #[test]
+    fn schema_v5_does_not_require_v6_plugin_configuration_tables() {
+        assert!(table_optional_for_schema(5, "plugin_configuration"));
+        assert!(table_optional_for_schema(5, "plugin_config_audit"));
+        assert!(!table_optional_for_schema(6, "plugin_configuration"));
+        assert!(!table_optional_for_schema(6, "plugin_config_audit"));
+        assert!(table_optional_for_schema(3, "plugin_call_log"));
+        assert!(!table_optional_for_schema(4, "plugin_call_log"));
+        assert!(!table_optional_for_schema(5, "shows"));
     }
 }
