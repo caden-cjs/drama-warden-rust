@@ -202,7 +202,16 @@ fn video_file(name: &str) -> bool {
 fn non_canonical_extra(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     [
-        "抢鲜", "抢先", "沉浸版", "加更版", "番外", "预览", "预告", "花絮", "preview", "trailer",
+        "抢鲜",
+        "抢先",
+        "沉浸版",
+        "加更版",
+        "番外",
+        "预览",
+        "预告",
+        "花絮",
+        "preview",
+        "trailer",
     ]
     .iter()
     .any(|marker| lower.contains(marker))

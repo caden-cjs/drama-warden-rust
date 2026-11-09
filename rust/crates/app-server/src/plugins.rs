@@ -10,6 +10,10 @@ use std::{
 };
 
 use drama_warden_plugin_protocol::{PluginManifest, PluginRequest, PluginResponse};
+use ring::{
+    aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey},
+    rand::{SecureRandom, SystemRandom},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{AnyPool, Row};
@@ -24,10 +28,12 @@ use url::Url;
 const MAX_FRAME_BYTES: usize = 24 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 struct PluginCommandConfig {
+    #[serde(default)]
+    id: Option<String>,
     command: String,
     #[serde(default)]
     args: Vec<String>,
@@ -49,7 +55,20 @@ pub struct PluginSummary {
     pub storage_contract: Option<Value>,
     pub subscriptions: Vec<String>,
     pub enabled: bool,
+    pub configured: bool,
+    pub active: bool,
+    pub configuration_error: Option<String>,
+    pub config_revision: u64,
     pub order: usize,
+}
+
+#[derive(Clone)]
+struct ResolvedConfiguration {
+    values: Value,
+    sources: HashMap<String, String>,
+    configured: bool,
+    error: Option<String>,
+    revision: u64,
 }
 
 #[derive(Debug)]
@@ -77,7 +96,18 @@ impl axum::response::IntoResponse for PluginFailure {
     fn into_response(self) -> axum::response::Response {
         let status = match self.code.as_str() {
             "PLUGIN_NOT_FOUND" => axum::http::StatusCode::NOT_FOUND,
-            "PLUGIN_DISABLED" => axum::http::StatusCode::CONFLICT,
+            "PLUGIN_DISABLED"
+            | "PLUGIN_CONFIG_REVISION_CONFLICT"
+            | "PLUGIN_CONFIG_APPLY_FAILED" => axum::http::StatusCode::CONFLICT,
+            "PLUGIN_CONFIG_INVALID"
+            | "PLUGIN_CONFIG_REQUIRED"
+            | "PLUGIN_CONFIG_SECRET_KEY_MISSING"
+            | "PLUGIN_CONFIG_SECRET_DECRYPT_FAILED"
+            | "PLUGIN_CONFIG_FIELD_SCOPE" => axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "PLUGIN_CONFIG_READ_FAILED" | "PLUGIN_CONFIG_STORE_FAILED" => {
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            }
+            "PLUGIN_UNAVAILABLE" => axum::http::StatusCode::SERVICE_UNAVAILABLE,
             "PLUGIN_CAPABILITY_UNSUPPORTED" => axum::http::StatusCode::UNPROCESSABLE_ENTITY,
             "PLUGIN_TIMEOUT" | "PLUGIN_IO_ERROR" => axum::http::StatusCode::BAD_GATEWAY,
             _ => axum::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -249,9 +279,11 @@ async fn read_bounded_line<R: AsyncBufRead + Unpin>(reader: &mut R) -> io::Resul
 struct PluginEntry {
     manifest: PluginManifest,
     process: Mutex<PluginProcess>,
-    config: Value,
+    config: RwLock<ResolvedConfiguration>,
+    command: PluginCommandConfig,
     timeout_ms: u64,
     enabled: AtomicBool,
+    active: AtomicBool,
     order: AtomicUsize,
 }
 
@@ -351,22 +383,95 @@ fn plugin_config(manifest: &PluginManifest) -> Result<Value, PluginFailure> {
                 }
             });
         if value.is_none_or(|value| value.trim().is_empty()) {
-            if field.required {
-                return Err(PluginFailure::new("PLUGIN_CONFIG_REQUIRED"));
+            if let Some(default) = &field.default {
+                config.insert(field.key.clone(), default.clone());
             }
             continue;
         }
         let value = value.unwrap();
-        if field.field_type == "url" {
-            let parsed =
-                Url::parse(value).map_err(|_| PluginFailure::new("PLUGIN_CONFIG_INVALID"))?;
-            if !["http", "https"].contains(&parsed.scheme()) {
-                return Err(PluginFailure::new("PLUGIN_CONFIG_INVALID"));
-            }
-        }
-        config.insert(field.key.clone(), Value::String(value.clone()));
+        let parsed = match field.field_type.as_str() {
+            "integer" => Value::Number(
+                value
+                    .parse::<i64>()
+                    .map_err(|_| PluginFailure::new("PLUGIN_CONFIG_INVALID"))?
+                    .into(),
+            ),
+            "boolean" => match value.to_ascii_lowercase().as_str() {
+                "true" | "1" => json!(true),
+                "false" | "0" => json!(false),
+                _ => return Err(PluginFailure::new("PLUGIN_CONFIG_INVALID")),
+            },
+            _ => Value::String(value.clone()),
+        };
+        validate_config_value(&manifest.id, field, &parsed)?;
+        config.insert(field.key.clone(), parsed);
     }
     Ok(Value::Object(config))
+}
+
+fn encryption_key() -> Result<LessSafeKey, PluginFailure> {
+    let raw = env::var("PLUGIN_CONFIG_ENCRYPTION_KEY")
+        .map_err(|_| PluginFailure::new("PLUGIN_CONFIG_SECRET_KEY_MISSING"))?;
+    let bytes =
+        hex::decode(raw).map_err(|_| PluginFailure::new("PLUGIN_CONFIG_SECRET_KEY_MISSING"))?;
+    let key = UnboundKey::new(&AES_256_GCM, &bytes)
+        .map_err(|_| PluginFailure::new("PLUGIN_CONFIG_SECRET_KEY_MISSING"))?;
+    Ok(LessSafeKey::new(key))
+}
+
+fn seal_secret(
+    plugin_id: &str,
+    field: &str,
+    schema: u16,
+    value: &str,
+) -> Result<String, PluginFailure> {
+    let key = encryption_key()?;
+    let mut nonce_bytes = [0u8; 12];
+    SystemRandom::new()
+        .fill(&mut nonce_bytes)
+        .map_err(|_| PluginFailure::new("PLUGIN_CONFIG_ENCRYPT_FAILED"))?;
+    let nonce = Nonce::assume_unique_for_key(nonce_bytes);
+    let aad = format!("{plugin_id}:{field}:{schema}");
+    let mut data = value.as_bytes().to_vec();
+    key.seal_in_place_append_tag(nonce, Aad::from(aad.as_bytes()), &mut data)
+        .map_err(|_| PluginFailure::new("PLUGIN_CONFIG_ENCRYPT_FAILED"))?;
+    Ok(format!(
+        "v1:{}:{}",
+        hex::encode(nonce_bytes),
+        hex::encode(data)
+    ))
+}
+
+fn open_secret(
+    plugin_id: &str,
+    field: &str,
+    schema: u16,
+    envelope: &str,
+) -> Result<String, PluginFailure> {
+    let key = encryption_key()?;
+    let mut parts = envelope.split(':');
+    if parts.next() != Some("v1") {
+        return Err(PluginFailure::new("PLUGIN_CONFIG_SECRET_DECRYPT_FAILED"));
+    }
+    let nonce = hex::decode(parts.next().unwrap_or_default())
+        .map_err(|_| PluginFailure::new("PLUGIN_CONFIG_SECRET_DECRYPT_FAILED"))?;
+    let mut data = hex::decode(parts.next().unwrap_or_default())
+        .map_err(|_| PluginFailure::new("PLUGIN_CONFIG_SECRET_DECRYPT_FAILED"))?;
+    if parts.next().is_some() || nonce.len() != 12 {
+        return Err(PluginFailure::new("PLUGIN_CONFIG_SECRET_DECRYPT_FAILED"));
+    }
+    let mut nonce_bytes = [0u8; 12];
+    nonce_bytes.copy_from_slice(&nonce);
+    let aad = format!("{plugin_id}:{field}:{schema}");
+    let plain = key
+        .open_in_place(
+            Nonce::assume_unique_for_key(nonce_bytes),
+            Aad::from(aad.as_bytes()),
+            &mut data,
+        )
+        .map_err(|_| PluginFailure::new("PLUGIN_CONFIG_SECRET_DECRYPT_FAILED"))?;
+    String::from_utf8(plain.to_vec())
+        .map_err(|_| PluginFailure::new("PLUGIN_CONFIG_SECRET_DECRYPT_FAILED"))
 }
 
 fn public_id_valid(id: &str) -> bool {
@@ -375,6 +480,39 @@ fn public_id_valid(id: &str) -> bool {
         && id
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn validate_config_value(
+    plugin_id: &str,
+    field: &drama_warden_plugin_protocol::ConfigField,
+    value: &Value,
+) -> Result<(), PluginFailure> {
+    let valid = match field.field_type.as_str() {
+        "text" | "password" => value.as_str().is_some_and(|text| !text.trim().is_empty()),
+        "path" => value.as_str().is_some_and(|text| {
+            !text.trim().is_empty()
+                && !text.contains('\0')
+                && (!(matches!(plugin_id, "quark" | "pan115") && field.key == "cliPath")
+                    || std::path::Path::new(text).is_absolute())
+        }),
+        "url" => value
+            .as_str()
+            .and_then(|text| Url::parse(text).ok())
+            .is_some_and(|url| ["http", "https"].contains(&url.scheme())),
+        "boolean" => value.is_boolean(),
+        "integer" => value.as_i64().is_some_and(|number| {
+            field.min.is_none_or(|min| number >= min) && field.max.is_none_or(|max| number <= max)
+        }),
+        "select" => value
+            .as_str()
+            .is_some_and(|selected| field.options.iter().any(|option| option.value == selected)),
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(PluginFailure::new("PLUGIN_CONFIG_INVALID"))
+    }
 }
 
 impl PluginHost {
@@ -389,7 +527,9 @@ impl PluginHost {
 
     pub async fn load_configured(&self) -> Result<(), PluginFailure> {
         if env::var("DRAMA_WARDEN_PLUGINS").is_ok_and(|value| !value.trim().is_empty()) {
-            return Err(PluginFailure::new("PLUGIN_MODULE_LOADING_NOT_MIGRATED"));
+            tracing::warn!(
+                "DRAMA_WARDEN_PLUGINS is ignored by the Rust host; install plugin commands through deployment configuration"
+            );
         }
         let raw = env::var("DRAMA_WARDEN_PLUGIN_COMMANDS").unwrap_or_default();
         let executable = env::current_exe()
@@ -397,61 +537,43 @@ impl PluginHost {
             .to_string_lossy()
             .into_owned();
         let mut commands = vec![PluginCommandConfig {
+            id: Some("tvmaze".to_owned()),
             command: executable.clone(),
             args: vec!["--plugin".to_owned(), "tvmaze".to_owned()],
             timeout_ms: None,
         }];
-        if env::var("TMDB_API_KEY").is_ok_and(|value| !value.trim().is_empty())
-            || env::var("DRAMA_WARDEN_PLUGIN_TMDB_API_KEY")
-                .is_ok_and(|value| !value.trim().is_empty())
+        commands.push(PluginCommandConfig {
+            id: Some("tmdb".to_owned()),
+            command: executable,
+            args: vec!["--plugin".to_owned(), "tmdb".to_owned()],
+            timeout_ms: None,
+        });
         {
-            commands.push(PluginCommandConfig {
-                command: executable,
-                args: vec!["--plugin".to_owned(), "tmdb".to_owned()],
-                timeout_ms: None,
-            });
-        }
-        if raw.trim().is_empty() {
             let node_bridge = |id: &str| PluginCommandConfig {
+                id: Some(id.to_owned()),
                 command: "node".to_owned(),
                 args: vec![
                     "backend/plugins/node-protocol-bridge.mjs".to_owned(),
                     id.to_owned(),
                 ],
+                // Quark resolves a virtual path by browsing each parent
+                // directory through the official CLI. A complete listing of
+                // a deep path can take several CLI calls, each near 20s.
                 timeout_ms: None,
             };
-            let configured =
-                |name: &str| env::var(name).is_ok_and(|value| !value.trim().is_empty());
-            if env::var("LOCAL_STORAGE_ENABLED").is_ok_and(|value| value == "true") {
-                commands.push(node_bridge("local-storage"));
-                commands.push(node_bridge("local-resource"));
-            }
-            if configured("QUARK_CLI_PATH") {
-                commands.push(node_bridge("quark"));
-            }
-            if configured("PAN115_CLI_PATH") || configured("PAN115_COOKIE") {
-                commands.push(node_bridge("pan115"));
-            }
-            if configured("CLOUDSAVER_URL")
-                && configured("CLOUDSAVER_USER")
-                && configured("CLOUDSAVER_PASS")
-            {
-                commands.push(node_bridge("cloudsaver"));
-            }
-            if configured("SMARTSTRM_BASE_URL") && configured("SMARTSTRM_WEBHOOK_TOKEN") {
-                commands.push(node_bridge("smartstrm"));
-            }
-            if configured("WPS_QUERY_URL") {
-                commands.push(node_bridge("wps-query"));
-            }
-            if configured("FEISHU_WEBHOOK_URL") || configured("UPDATE_EVENT_WEBHOOK_URL") {
-                commands.push(node_bridge("feishu-notification"));
-            }
-            if configured("OPENSUBTITLES_API_KEY") {
-                commands.push(node_bridge("opensubtitles"));
-            }
-            if env::var("SUBTITLE_ASSRT_ENABLED").is_ok_and(|value| value == "true") {
-                commands.push(node_bridge("assrt"));
+            for id in [
+                "local-storage",
+                "local-resource",
+                "quark",
+                "pan115",
+                "cloudsaver",
+                "smartstrm",
+                "wps-query",
+                "feishu-notification",
+                "opensubtitles",
+                "assrt",
+            ] {
+                commands.push(node_bridge(id));
             }
         }
         if !raw.trim().is_empty() {
@@ -469,7 +591,9 @@ impl PluginHost {
             return Err(PluginFailure::new("PLUGIN_COMMAND_CONFIG_INVALID"));
         }
         for (order, config) in commands.iter().enumerate() {
-            self.load_one(config, order).await?;
+            if let Err(error) = self.load_one(config, order).await {
+                tracing::warn!(plugin_id = ?config.id, code = %error.code, "plugin registration failed; continuing with remaining plugins");
+            }
         }
         self.restore_settings().await?;
         Ok(())
@@ -496,13 +620,93 @@ impl PluginHost {
         if !public_id_valid(&manifest.id) {
             return Err(PluginFailure::new("PLUGIN_MANIFEST_INVALID"));
         }
-        let config_value = plugin_config(&manifest)?;
+        if config.id.as_ref().is_some_and(|id| id != &manifest.id) {
+            return Err(PluginFailure::new("PLUGIN_ID_MISMATCH"));
+        }
+        let mut config_value = plugin_config(&manifest)?;
+        let mut sources = HashMap::new();
+        let mut revision = 0;
+        for field in &manifest.config_schema.fields {
+            if config_value.get(&field.key).is_some()
+                && field.default.as_ref() != config_value.get(&field.key)
+            {
+                sources.insert(field.key.clone(), "legacyEnvironment".to_owned());
+            }
+        }
+        let row = sqlx::query("SELECT CAST(config_json AS CHAR) AS config_json, CAST(secrets_json AS CHAR) AS secrets_json, schema_version, revision FROM plugin_configuration WHERE plugin_id=?")
+            .bind(&manifest.id).fetch_optional(&self.audit_pool).await.map_err(|_| PluginFailure::new("PLUGIN_CONFIG_READ_FAILED"))?;
+        let mut config_error = None;
+        if let Some(row) = row {
+            let read_json = |row: &sqlx::any::AnyRow, key: &str| -> Result<Value, PluginFailure> {
+                let text = row
+                    .try_get::<String, _>(key)
+                    .or_else(|_| {
+                        row.try_get::<Vec<u8>, _>(key).and_then(|bytes| {
+                            String::from_utf8(bytes)
+                                .map_err(|_| sqlx::Error::Decode("invalid utf8".into()))
+                        })
+                    })
+                    .map_err(|_| PluginFailure::new("PLUGIN_CONFIG_INVALID"))?;
+                serde_json::from_str(&text).map_err(|_| PluginFailure::new("PLUGIN_CONFIG_INVALID"))
+            };
+            let stored = read_json(&row, "config_json")?;
+            let secrets = read_json(&row, "secrets_json")?;
+            revision = row.try_get::<i64, _>("revision").unwrap_or(0).max(0) as u64;
+            let stored_schema = row.try_get::<i64, _>("schema_version").unwrap_or(1) as u16;
+            if stored_schema != manifest.config_schema.version {
+                config_error = Some("PLUGIN_CONFIG_MIGRATION_REQUIRED".to_owned());
+            }
+            for field in &manifest.config_schema.fields {
+                if !field.is_secret() {
+                    if let Some(value) = stored.get(&field.key) {
+                        config_value[&field.key] = value.clone();
+                        sources.insert(field.key.clone(), "database".to_owned());
+                    }
+                } else if let Some(envelope) = secrets.get(&field.key).and_then(Value::as_str) {
+                    match open_secret(&manifest.id, &field.key, stored_schema, envelope) {
+                        Ok(value) => {
+                            config_value[&field.key] = json!(value);
+                            sources.insert(field.key.clone(), "database".to_owned());
+                        }
+                        Err(error) => {
+                            config_value.as_object_mut().unwrap().remove(&field.key);
+                            config_error = Some(error.code);
+                        }
+                    }
+                }
+            }
+        }
+        let configured = config_error.is_none()
+            && manifest.config_schema.fields.iter().all(|field| {
+                !field.required
+                    || config_value
+                        .get(&field.key)
+                        .is_some_and(|value| !value.is_null())
+            });
+        let has_legacy_values = !config_value
+            .as_object()
+            .is_none_or(|values| values.is_empty());
+        let local_storage_disabled = ["local-storage", "local-resource"]
+            .contains(&manifest.id.as_str())
+            && env::var("LOCAL_STORAGE_ENABLED")
+                .is_ok_and(|value| value.eq_ignore_ascii_case("false"));
+        let default_enabled = !local_storage_disabled
+            && (manifest.id == "tvmaze" || (configured && has_legacy_values));
         let entry = Arc::new(PluginEntry {
             manifest: manifest.clone(),
             process: Mutex::new(process),
-            config: config_value,
+            config: RwLock::new(ResolvedConfiguration {
+                values: config_value,
+                sources,
+                configured,
+                error: config_error
+                    .or_else(|| (!configured).then(|| "PLUGIN_CONFIG_REQUIRED".to_owned())),
+                revision,
+            }),
+            command: config.clone(),
             timeout_ms,
-            enabled: AtomicBool::new(true),
+            enabled: AtomicBool::new(default_enabled),
+            active: AtomicBool::new(false),
             order: AtomicUsize::new(order),
         });
         let mut entries = self.entries.write().await;
@@ -544,6 +748,22 @@ impl PluginHost {
                 storage_contract: entry.manifest.storage_contract.clone(),
                 subscriptions: entry.manifest.subscriptions.clone(),
                 enabled: entry.enabled.load(Ordering::SeqCst),
+                configured: entry
+                    .config
+                    .try_read()
+                    .map(|config| config.configured)
+                    .unwrap_or(false),
+                active: entry.active.load(Ordering::SeqCst),
+                configuration_error: entry
+                    .config
+                    .try_read()
+                    .ok()
+                    .and_then(|config| config.error.clone()),
+                config_revision: entry
+                    .config
+                    .try_read()
+                    .map(|config| config.revision)
+                    .unwrap_or(0),
                 order: entry.order.load(Ordering::SeqCst),
             })
             .collect();
@@ -553,6 +773,350 @@ impl PluginHost {
                 .then_with(|| left.id.cmp(&right.id))
         });
         result
+    }
+
+    pub async fn configuration(&self, id: &str) -> Result<Value, PluginFailure> {
+        let entry = self.entry(id).await?;
+        let config = entry.config.read().await;
+        let fields = entry
+            .manifest
+            .config_schema
+            .fields
+            .iter()
+            .map(|field| {
+                let value = config.values.get(&field.key);
+                let source = config
+                    .sources
+                    .get(&field.key)
+                    .cloned()
+                    .or_else(|| {
+                        if value.is_none() {
+                            Some("unset".to_owned())
+                        } else if field.scope == "deployment" {
+                            Some("deployment".to_owned())
+                        } else if field.default.as_ref() == value {
+                            Some("manifestDefault".to_owned())
+                        } else {
+                            Some("legacyEnvironment".to_owned())
+                        }
+                    })
+                    .unwrap_or_else(|| "unset".to_owned());
+                let mut item = json!({
+                    "key": field.key, "type": field.field_type, "label": field.label,
+                    "description": field.description, "required": field.required,
+                    "secret": field.is_secret(), "scope": field.scope,
+                    "configured": value.is_some_and(|v| !v.is_null()),
+                    "source": source,
+                    "editable": field.scope == "runtime"
+                });
+                if !field.is_secret() {
+                    if let Some(value) = value {
+                        item["value"] = value.clone();
+                    }
+                }
+                item
+            })
+            .collect::<Vec<_>>();
+        Ok(
+            json!({ "pluginId": id, "schemaVersion": entry.manifest.config_schema.version,
+            "configured": config.configured, "enabled": entry.enabled.load(Ordering::SeqCst),
+            "active": entry.active.load(Ordering::SeqCst), "revision": config.revision, "fields": fields }),
+        )
+    }
+
+    pub async fn validate_configuration(
+        &self,
+        id: &str,
+        patch: &Value,
+    ) -> Result<Value, PluginFailure> {
+        let entry = self.entry(id).await?;
+        let object = patch
+            .as_object()
+            .ok_or_else(|| PluginFailure::new("PLUGIN_CONFIG_INVALID"))?;
+        let current = entry.config.read().await;
+        for (key, value) in object {
+            let field = entry
+                .manifest
+                .config_schema
+                .fields
+                .iter()
+                .find(|field| &field.key == key)
+                .ok_or_else(|| PluginFailure::new("PLUGIN_CONFIG_INVALID"))?;
+            if field.scope != "runtime" {
+                return Err(PluginFailure::new("PLUGIN_CONFIG_FIELD_SCOPE"));
+            }
+            if value.is_null() {
+                if field.required {
+                    return Err(PluginFailure::new("PLUGIN_CONFIG_REQUIRED"));
+                }
+                continue;
+            }
+            validate_config_value(id, field, value)?;
+        }
+        let mut values = current.values.clone();
+        for (key, value) in object {
+            if value.is_null() {
+                values.as_object_mut().unwrap().remove(key);
+            } else {
+                values[key] = value.clone();
+            }
+        }
+        for field in &entry.manifest.config_schema.fields {
+            if field.required && values.get(&field.key).is_none_or(|value| value.is_null()) {
+                return Err(PluginFailure::new("PLUGIN_CONFIG_REQUIRED"));
+            }
+        }
+        Ok(json!({"valid":true,"pluginId":id,"issues":[]}))
+    }
+
+    pub async fn save_configuration(
+        &self,
+        id: &str,
+        patch: &Value,
+        expected_revision: u64,
+    ) -> Result<Value, PluginFailure> {
+        self.validate_configuration(id, patch).await?;
+        let _guard = self.settings_queue.lock().await;
+        let entry = self.entry(id).await?;
+        let mut current = entry.config.write().await;
+        if current.revision != expected_revision {
+            return Err(PluginFailure::new("PLUGIN_CONFIG_REVISION_CONFLICT"));
+        }
+        let mut values = current.values.clone();
+        let base_values = plugin_config(&entry.manifest)?;
+        let existing_row = sqlx::query("SELECT CAST(config_json AS CHAR) AS config_json, CAST(secrets_json AS CHAR) AS secrets_json FROM plugin_configuration WHERE plugin_id=?")
+            .bind(id).fetch_optional(&self.audit_pool).await.map_err(|_| PluginFailure::new("PLUGIN_CONFIG_STORE_FAILED"))?;
+        let read_json = |row: &sqlx::any::AnyRow, key: &str| -> Result<Value, PluginFailure> {
+            let text = row
+                .try_get::<String, _>(key)
+                .or_else(|_| {
+                    row.try_get::<Vec<u8>, _>(key).and_then(|bytes| {
+                        String::from_utf8(bytes)
+                            .map_err(|_| sqlx::Error::Decode("invalid utf8".into()))
+                    })
+                })
+                .map_err(|_| PluginFailure::new("PLUGIN_CONFIG_INVALID"))?;
+            serde_json::from_str(&text).map_err(|_| PluginFailure::new("PLUGIN_CONFIG_INVALID"))
+        };
+        let mut overrides = if let Some(row) = &existing_row {
+            read_json(row, "config_json")?
+        } else {
+            json!({})
+        };
+        let mut secrets = existing_row
+            .as_ref()
+            .map(|row| read_json(row, "secrets_json"))
+            .transpose()?
+            .unwrap_or_else(|| json!({}))
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        let mut safe = serde_json::Map::new();
+        for (key, value) in patch.as_object().unwrap() {
+            let field = entry
+                .manifest
+                .config_schema
+                .fields
+                .iter()
+                .find(|field| &field.key == key)
+                .unwrap();
+            if field.is_secret() {
+                if value.is_null() {
+                    secrets.remove(key);
+                    if let Some(fallback) = base_values.get(key) {
+                        values[key] = fallback.clone();
+                    } else {
+                        values.as_object_mut().unwrap().remove(key);
+                    }
+                } else {
+                    let text = value
+                        .as_str()
+                        .filter(|text| !text.trim().is_empty())
+                        .ok_or_else(|| PluginFailure::new("PLUGIN_CONFIG_INVALID"))?;
+                    secrets.insert(
+                        key.clone(),
+                        json!(seal_secret(
+                            id,
+                            key,
+                            entry.manifest.config_schema.version,
+                            text
+                        )?),
+                    );
+                    values[key] = json!(text);
+                }
+            } else if value.is_null() {
+                if let Some(fallback) = base_values.get(key) {
+                    values[key] = fallback.clone();
+                } else {
+                    values.as_object_mut().unwrap().remove(key);
+                }
+                overrides.as_object_mut().unwrap().remove(key);
+            } else {
+                values[key] = value.clone();
+                overrides[key] = value.clone();
+            }
+            safe.insert(key.clone(), json!({"key":key,"configured":values.get(key).is_some_and(|v| !v.is_null()),"source":if value.is_null() { "legacyEnvironment" } else { "database" },"secret":field.is_secret()}));
+        }
+        let new_revision = current.revision + 1;
+        let configured = entry.manifest.config_schema.fields.iter().all(|field| {
+            !field.required || values.get(&field.key).is_some_and(|value| !value.is_null())
+        });
+        let mut candidate = None;
+        if entry.enabled.load(Ordering::SeqCst) && configured {
+            let mut process = PluginProcess::spawn(&entry.command).await?;
+            let manifest: PluginManifest = serde_json::from_value(
+                process
+                    .request("manifest", json!({}), None, entry.timeout_ms)
+                    .await?,
+            )
+            .map_err(|_| PluginFailure::new("PLUGIN_MANIFEST_INVALID"))?;
+            if manifest.id != id
+                || manifest.api_version != entry.manifest.api_version
+                || manifest.config_schema.version != entry.manifest.config_schema.version
+            {
+                return Err(PluginFailure::new("PLUGIN_MANIFEST_INVALID"));
+            }
+            manifest
+                .validate()
+                .map_err(|_| PluginFailure::new("PLUGIN_MANIFEST_INVALID"))?;
+            process
+                .request(
+                    "initialize",
+                    json!({"config":values}),
+                    None,
+                    entry.timeout_ms,
+                )
+                .await
+                .map_err(|_| PluginFailure::new("PLUGIN_CONFIG_APPLY_FAILED"))?;
+            candidate = Some(process);
+        }
+        let config_json = overrides.to_string();
+        let secrets_json = Value::Object(secrets).to_string();
+        let field_keys = patch
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let secret_keys = field_keys
+            .iter()
+            .filter(|key| {
+                entry
+                    .manifest
+                    .config_schema
+                    .fields
+                    .iter()
+                    .any(|field| &field.key == *key && field.is_secret())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let exists = sqlx::query("SELECT revision FROM plugin_configuration WHERE plugin_id=?")
+            .bind(id)
+            .fetch_optional(&self.audit_pool)
+            .await
+            .map_err(|_| PluginFailure::new("PLUGIN_CONFIG_STORE_FAILED"))?;
+        if exists.is_some() {
+            sqlx::query("UPDATE plugin_configuration SET schema_version=?, config_json=?, secrets_json=?, revision=?, updated_at=CURRENT_TIMESTAMP WHERE plugin_id=?")
+                .bind(entry.manifest.config_schema.version as i64).bind(config_json).bind(secrets_json).bind(new_revision as i64).bind(id).execute(&self.audit_pool).await.map_err(|_| PluginFailure::new("PLUGIN_CONFIG_STORE_FAILED"))?;
+        } else {
+            sqlx::query("INSERT INTO plugin_configuration (plugin_id,schema_version,config_json,secrets_json,revision) VALUES (?,?,?,?,?)")
+                .bind(id).bind(entry.manifest.config_schema.version as i64).bind(config_json).bind(secrets_json).bind(new_revision as i64).execute(&self.audit_pool).await.map_err(|_| PluginFailure::new("PLUGIN_CONFIG_STORE_FAILED"))?;
+        }
+        let audit = sqlx::query("INSERT INTO plugin_config_audit (plugin_id,field_keys_json,secret_field_keys_json,outcome_code,revision) VALUES (?,?,?,NULL,?)")
+            .bind(id).bind(json!(field_keys).to_string()).bind(json!(secret_keys).to_string()).bind(new_revision as i64).execute(&self.audit_pool).await;
+        if audit.is_err() {
+            tracing::warn!(plugin_id = id, "plugin configuration audit write failed");
+        }
+        current.values = values;
+        current.configured = configured;
+        current.revision = new_revision;
+        for (key, value) in patch.as_object().unwrap() {
+            if value.is_null() {
+                current.sources.remove(key);
+            } else {
+                current.sources.insert(key.clone(), "database".to_owned());
+            }
+        }
+        if let Some(candidate) = candidate {
+            *entry.process.lock().await = candidate;
+            entry.active.store(true, Ordering::SeqCst);
+        } else if !current.configured {
+            entry.active.store(false, Ordering::SeqCst);
+        }
+        Ok(
+            json!({"pluginId":id,"applied":entry.active.load(Ordering::SeqCst),"revision":new_revision,"fields":safe}),
+        )
+    }
+
+    pub async fn reset_configuration(
+        &self,
+        id: &str,
+        expected_revision: u64,
+    ) -> Result<Value, PluginFailure> {
+        let _guard = self.settings_queue.lock().await;
+        let entry = self.entry(id).await?;
+        let mut current = entry.config.write().await;
+        if current.revision != expected_revision {
+            return Err(PluginFailure::new("PLUGIN_CONFIG_REVISION_CONFLICT"));
+        }
+        let next_revision = current.revision + 1;
+        let values = plugin_config(&entry.manifest)?;
+        let configured = entry.manifest.config_schema.fields.iter().all(|field| {
+            !field.required || values.get(&field.key).is_some_and(|value| !value.is_null())
+        });
+        let mut candidate = None;
+        if entry.enabled.load(Ordering::SeqCst) && configured {
+            let mut process = PluginProcess::spawn(&entry.command).await?;
+            let manifest: PluginManifest = serde_json::from_value(
+                process
+                    .request("manifest", json!({}), None, entry.timeout_ms)
+                    .await?,
+            )
+            .map_err(|_| PluginFailure::new("PLUGIN_MANIFEST_INVALID"))?;
+            if manifest.id != id
+                || manifest.api_version != entry.manifest.api_version
+                || manifest.config_schema.version != entry.manifest.config_schema.version
+            {
+                return Err(PluginFailure::new("PLUGIN_MANIFEST_INVALID"));
+            }
+            manifest
+                .validate()
+                .map_err(|_| PluginFailure::new("PLUGIN_MANIFEST_INVALID"))?;
+            process
+                .request(
+                    "initialize",
+                    json!({"config":values}),
+                    None,
+                    entry.timeout_ms,
+                )
+                .await
+                .map_err(|_| PluginFailure::new("PLUGIN_CONFIG_APPLY_FAILED"))?;
+            candidate = Some(process);
+        }
+        let stored = sqlx::query("UPDATE plugin_configuration SET config_json='{}', secrets_json='{}', revision=?, updated_at=CURRENT_TIMESTAMP WHERE plugin_id=?")
+            .bind(next_revision as i64).bind(id).execute(&self.audit_pool).await.map_err(|_| PluginFailure::new("PLUGIN_CONFIG_STORE_FAILED"))?;
+        if stored.rows_affected() == 0 {
+            sqlx::query("INSERT INTO plugin_configuration (plugin_id,schema_version,config_json,secrets_json,revision) VALUES (?,?, '{}','{}',?)")
+                .bind(id).bind(entry.manifest.config_schema.version as i64).bind(next_revision as i64).execute(&self.audit_pool).await.map_err(|_| PluginFailure::new("PLUGIN_CONFIG_STORE_FAILED"))?;
+        }
+        current.values = values;
+        current.configured = configured;
+        current.error = (!configured).then(|| "PLUGIN_CONFIG_REQUIRED".to_owned());
+        current.sources.clear();
+        current.revision = next_revision;
+        let revision = current.revision;
+        if let Some(candidate) = candidate {
+            *entry.process.lock().await = candidate;
+            entry.active.store(true, Ordering::SeqCst);
+        } else {
+            entry.active.store(false, Ordering::SeqCst);
+        }
+        let audit = sqlx::query("INSERT INTO plugin_config_audit (plugin_id,field_keys_json,secret_field_keys_json,outcome_code,revision) VALUES (?,?,?,NULL,?)")
+            .bind(id).bind("[]").bind("[]").bind(revision as i64).execute(&self.audit_pool).await;
+        if audit.is_err() {
+            tracing::warn!(plugin_id = id, "plugin configuration audit write failed");
+        }
+        Ok(json!({"pluginId":id,"revision":revision,"configured":configured,"fields":[]}))
     }
 
     pub async fn invoke(
@@ -566,6 +1130,9 @@ impl PluginHost {
         let entry = self.entry(id).await?;
         if !entry.enabled.load(Ordering::SeqCst) {
             return Err(PluginFailure::new("PLUGIN_DISABLED"));
+        }
+        if !entry.active.load(Ordering::SeqCst) {
+            return Err(PluginFailure::new("PLUGIN_UNAVAILABLE"));
         }
         if !entry
             .manifest
@@ -612,18 +1179,26 @@ impl PluginHost {
     pub async fn initialize_all(&self) -> Result<(), PluginFailure> {
         let entries: Vec<_> = self.entries.read().await.values().cloned().collect();
         for entry in entries {
-            if entry.enabled.load(Ordering::SeqCst) {
-                entry
+            let config = entry.config.read().await.clone();
+            if entry.enabled.load(Ordering::SeqCst) && config.configured {
+                let result = entry
                     .process
                     .lock()
                     .await
                     .request(
                         "initialize",
-                        json!({"config": entry.config}),
+                        json!({"config": config.values}),
                         None,
                         entry.timeout_ms,
                     )
-                    .await?;
+                    .await;
+                match result {
+                    Ok(_) => entry.active.store(true, Ordering::SeqCst),
+                    Err(error) => {
+                        tracing::warn!(plugin_id = %entry.manifest.id, code = %error.code, "plugin initialization failed");
+                        entry.config.write().await.error = Some(error.code);
+                    }
+                }
             }
         }
         Ok(())
@@ -649,6 +1224,7 @@ impl PluginHost {
             .values()
             .filter(|entry| {
                 entry.enabled.load(Ordering::SeqCst)
+                    && entry.active.load(Ordering::SeqCst)
                     && entry
                         .manifest
                         .subscriptions
@@ -767,6 +1343,7 @@ impl PluginHost {
             settings.entry(id.to_owned()).or_insert_with(|| json!({}))["enabled"] = json!(false);
             self.write_settings(&settings).await?;
             entry.enabled.store(false, Ordering::SeqCst);
+            entry.active.store(false, Ordering::SeqCst);
             entry
                 .process
                 .lock()
@@ -775,13 +1352,17 @@ impl PluginHost {
                 .await
                 .map_err(|_| PluginFailure::new("PLUGIN_RESET_FAILED"))?;
         } else {
+            let config = entry.config.read().await.clone();
+            if !config.configured {
+                return Err(PluginFailure::new("PLUGIN_CONFIG_REQUIRED"));
+            }
             entry
                 .process
                 .lock()
                 .await
                 .request(
                     "initialize",
-                    json!({"config": entry.config}),
+                    json!({"config": config.values}),
                     None,
                     entry.timeout_ms,
                 )
@@ -797,6 +1378,7 @@ impl PluginHost {
                 return Err(error);
             }
             entry.enabled.store(true, Ordering::SeqCst);
+            entry.active.store(true, Ordering::SeqCst);
         }
         Ok(())
     }

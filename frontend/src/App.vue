@@ -104,7 +104,7 @@ async function refreshConnection() {
   databaseState.value = 'checking';
   try {
     const health = await api.request('/api/health');
-    databaseState.value = health.database === 'ok' ? 'ok' : 'error';
+    databaseState.value = health.ok === true && health.database !== 'unavailable' ? 'ok' : 'error';
   } catch {
     databaseState.value = 'error';
   }

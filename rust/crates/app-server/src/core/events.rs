@@ -492,15 +492,14 @@ pub async fn verify_recovery_claims(
     let mut expected = episode_numbers.to_vec();
     expected.sort_unstable();
     expected.dedup();
-    let valid =
-        if action == "retry_after_review"
-            && matches!(event.status.as_str(), "processing" | "failed")
-            && claims.is_empty()
-        {
-            true
-        } else {
-            !claims.is_empty() && actual == expected && expected.len() == episode_numbers.len()
-        };
+    let valid = if action == "retry_after_review"
+        && matches!(event.status.as_str(), "processing" | "failed")
+        && claims.is_empty()
+    {
+        true
+    } else {
+        !claims.is_empty() && actual == expected && expected.len() == episode_numbers.len()
+    };
     if !valid {
         return Err(EventError::Conflict("write_claims_changed"));
     }
@@ -1119,11 +1118,20 @@ pub async fn retry(pool: &AnyPool, id: i64, mysql: bool) -> Result<Event, EventE
             .map_err(EventError::Database)?;
         let mut actual = Vec::with_capacity(claims.len());
         for claim in claims {
-            let claim_storage: i64 = claim.try_get("show_storage_id").map_err(EventError::Database)?;
-            let claim_season: i64 = claim.try_get("season_number").map_err(EventError::Database)?;
-            let claim_episode: i64 = claim.try_get("episode_number").map_err(EventError::Database)?;
+            let claim_storage: i64 = claim
+                .try_get("show_storage_id")
+                .map_err(EventError::Database)?;
+            let claim_season: i64 = claim
+                .try_get("season_number")
+                .map_err(EventError::Database)?;
+            let claim_episode: i64 = claim
+                .try_get("episode_number")
+                .map_err(EventError::Database)?;
             let claim_status = text(&claim, "status")?;
-            if claim_storage != storage_id || claim_season != season_number || claim_status != "reserved" {
+            if claim_storage != storage_id
+                || claim_season != season_number
+                || claim_status != "reserved"
+            {
                 return Err(EventError::Conflict("followup_recovery_required"));
             }
             actual.push(claim_episode);

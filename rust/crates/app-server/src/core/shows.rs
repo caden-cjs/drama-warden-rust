@@ -155,10 +155,23 @@ fn parse_identity(row: &sqlx::any::AnyRow) -> Result<MetadataIdentity, ShowError
 }
 
 pub async fn list(pool: &AnyPool, mysql: bool) -> Result<Vec<Show>, ShowError> {
-    let rows = sqlx::query(&format!("{} ORDER BY LOWER(name), id", show_columns(mysql)))
-        .fetch_all(pool)
-        .await
-        .map_err(ShowError::Database)?;
+    // A legacy import can contain placeholder rows that were created while
+    // browsing a drive. Keep those rows in the database for recovery, but do
+    // not present them as managed programs until they have any watchlist
+    // evidence (a storage location, metadata, an episode catalog, or followup
+    // history). Newly created programs remain visible after a storage or
+    // metadata link is added.
+    let rows = sqlx::query(&format!(
+        "{} WHERE EXISTS (SELECT 1 FROM show_storage st WHERE st.show_id = shows.id) \
+         OR EXISTS (SELECT 1 FROM show_metadata_identity mi WHERE mi.show_id = shows.id) \
+         OR EXISTS (SELECT 1 FROM show_season ss WHERE ss.show_id = shows.id) \
+         OR EXISTS (SELECT 1 FROM update_event ue WHERE ue.show_id = shows.id) \
+         ORDER BY LOWER(name), id",
+        show_columns(mysql)
+    ))
+    .fetch_all(pool)
+    .await
+    .map_err(ShowError::Database)?;
     rows.iter().map(parse_show).collect()
 }
 

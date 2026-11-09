@@ -10,7 +10,7 @@ export default defineConfig({
   server: {
     host: '127.0.0.1',
     proxy: {
-      '/api': 'http://127.0.0.1:8080',
+      '/api': process.env.DRAMA_WARDEN_API_TARGET || 'http://127.0.0.1:8080',
     },
   },
   build: {

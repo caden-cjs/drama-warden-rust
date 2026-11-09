@@ -23,6 +23,8 @@ const TABLES: &[&str] = &[
     "subtitle_job",
     "application_setting",
     "plugin_call_log",
+    "plugin_configuration",
+    "plugin_config_audit",
 ];
 
 const VERSION_3_TABLES: &[&str] = &[
@@ -56,6 +58,22 @@ const VERSION_4_TABLES: &[&str] = &[
     "plugin_call_log",
 ];
 
+const VERSION_5_TABLES: &[&str] = &[
+    "shows",
+    "show_metadata_identity",
+    "show_season",
+    "show_episode",
+    "show_episode_metadata",
+    "show_storage",
+    "show_episode_asset",
+    "show_episode_storage",
+    "show_episode_write_claim",
+    "update_event",
+    "subtitle_job",
+    "application_setting",
+    "plugin_call_log",
+];
+
 const MAX_IMPORT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const BINARY_MARKER: &str = "$dramaWardenBinaryV1";
 const PRIMARY_KEYS: &[(&str, &str)] = &[
@@ -72,6 +90,8 @@ const PRIMARY_KEYS: &[(&str, &str)] = &[
     ("subtitle_job", "id"),
     ("application_setting", "setting_key"),
     ("plugin_call_log", "id"),
+    ("plugin_configuration", "plugin_id"),
+    ("plugin_config_audit", "id"),
 ];
 
 struct TableExport<'a> {
@@ -156,7 +176,7 @@ fn validate_snapshot(snapshot: &Value) -> Result<(i64, HashMap<&str, TableExport
     let version = object
         .get("schemaVersion")
         .and_then(Value::as_i64)
-        .filter(|version| [3, 4, 5].contains(version))
+        .filter(|version| [3, 4, 5, 6].contains(version))
         .ok_or_else(|| "unsupported Drama Warden database export schema".to_owned())?;
     if object.get("format").and_then(Value::as_str) != Some("drama-warden-database-export")
         || object.get("formatVersion").and_then(Value::as_i64) != Some(1)
@@ -174,6 +194,7 @@ fn validate_snapshot(snapshot: &Value) -> Result<(i64, HashMap<&str, TableExport
     let expected = match version {
         3 => VERSION_3_TABLES,
         4 => VERSION_4_TABLES,
+        5 => VERSION_5_TABLES,
         _ => TABLES,
     };
     if tables_value.len() != expected.len()
@@ -459,7 +480,7 @@ pub async fn export_snapshot(pool: &sqlx::AnyPool, driver: &str) -> Result<Value
     Ok(serde_json::json!({
         "format": "drama-warden-database-export",
         "formatVersion": 1,
-        "schemaVersion": 5,
+        "schemaVersion": 6,
         "sourceDriver": driver,
         "exportedAt": portable_timestamp(&exported_at),
         "tables": exported_tables,
