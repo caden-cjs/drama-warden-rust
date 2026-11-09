@@ -493,7 +493,10 @@ pub async fn verify_recovery_claims(
     expected.sort_unstable();
     expected.dedup();
     let valid =
-        if action == "retry_after_review" && event.status == "processing" && claims.is_empty() {
+        if action == "retry_after_review"
+            && matches!(event.status.as_str(), "processing" | "failed")
+            && claims.is_empty()
+        {
             true
         } else {
             !claims.is_empty() && actual == expected && expected.len() == episode_numbers.len()
@@ -572,13 +575,37 @@ pub async fn recover_followup_no_output(
         actual.push(episode);
     }
     actual.sort_unstable();
-    let claims_valid = if status == "processing" && claims.is_empty() {
+    // A follow-up can fail before it reserves any write claims (for example,
+    // when share revalidation rejects the selected files). The recovery API
+    // has already checked the live destination listing before calling this
+    // function, so an explicitly reviewed no-output retry is safe here too.
+    let claims_valid = if claims.is_empty() {
         true
     } else {
         actual == expected
     };
-    if !claims_valid || (status == "failed" && claims.is_empty()) {
+    if !claims_valid {
         return Err(EventError::Conflict("write_claims_changed"));
+    }
+    if claims.is_empty() {
+        let insert = if mysql {
+            "INSERT INTO show_episode_write_claim (show_storage_id, season_number, episode_number, event_id, status) VALUES (?, ?, ?, ?, 'reserved') ON DUPLICATE KEY UPDATE id = id"
+        } else {
+            "INSERT INTO show_episode_write_claim (show_storage_id, season_number, episode_number, event_id, status) VALUES (?, ?, ?, ?, 'reserved') ON CONFLICT(show_storage_id, season_number, episode_number) DO NOTHING"
+        };
+        for episode in &expected {
+            let result = sqlx::query(insert)
+                .bind(storage_id)
+                .bind(season_number)
+                .bind(episode)
+                .bind(event_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(EventError::Database)?;
+            if result.rows_affected() != 1 {
+                return Err(EventError::Conflict("write_claim_conflict"));
+            }
+        }
     }
     let timestamp = if mysql {
         "CURRENT_TIMESTAMP(3)"
@@ -1044,11 +1071,68 @@ pub async fn retry(pool: &AnyPool, id: i64, mysql: bool) -> Result<Event, EventE
         .map(parse_event)
         .transpose()?
         .ok_or(EventError::NotFound)?;
-    if current.kind == "new_ep" {
-        return Err(EventError::Conflict("followup_recovery_required"));
-    }
     if current.status != "failed" || !current.retryable {
         return Err(EventError::Conflict("event_not_retryable"));
+    }
+    if current.kind == "new_ep" {
+        let reviewed_no_output = current
+            .last_error
+            .as_deref()
+            .is_some_and(|value| value.starts_with("INTERRUPTED_REVIEW_CONFIRMED_NO_OUTPUT"));
+        let storage_id = current
+            .payload
+            .get("storageId")
+            .and_then(Value::as_i64)
+            .filter(|value| *value > 0)
+            .ok_or(EventError::Conflict("followup_recovery_required"))?;
+        let season_number = current
+            .payload
+            .get("seasonNumber")
+            .and_then(Value::as_i64)
+            .filter(|value| *value > 0)
+            .ok_or(EventError::Conflict("followup_recovery_required"))?;
+        let selected = current
+            .payload
+            .get("selectedFiles")
+            .and_then(Value::as_array)
+            .filter(|files| !files.is_empty())
+            .ok_or(EventError::Conflict("followup_recovery_required"))?;
+        let mut expected = Vec::with_capacity(selected.len());
+        for file in selected {
+            let episode = file
+                .get("episodeNumber")
+                .and_then(Value::as_i64)
+                .filter(|value| *value > 0)
+                .ok_or(EventError::Conflict("followup_recovery_required"))?;
+            if expected.contains(&episode) {
+                return Err(EventError::Conflict("followup_recovery_required"));
+            }
+            expected.push(episode);
+        }
+        if !reviewed_no_output {
+            return Err(EventError::Conflict("followup_recovery_required"));
+        }
+        let claims = sqlx::query("SELECT show_storage_id, season_number, episode_number, status FROM show_episode_write_claim WHERE event_id = ? ORDER BY episode_number")
+            .bind(id)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(EventError::Database)?;
+        let mut actual = Vec::with_capacity(claims.len());
+        for claim in claims {
+            let claim_storage: i64 = claim.try_get("show_storage_id").map_err(EventError::Database)?;
+            let claim_season: i64 = claim.try_get("season_number").map_err(EventError::Database)?;
+            let claim_episode: i64 = claim.try_get("episode_number").map_err(EventError::Database)?;
+            let claim_status = text(&claim, "status")?;
+            if claim_storage != storage_id || claim_season != season_number || claim_status != "reserved" {
+                return Err(EventError::Conflict("followup_recovery_required"));
+            }
+            actual.push(claim_episode);
+        }
+        actual.sort_unstable();
+        expected.sort_unstable();
+        if actual != expected {
+            return Err(EventError::Conflict("followup_recovery_required"));
+        }
     }
     let timestamp = if mysql {
         "CURRENT_TIMESTAMP(3)"

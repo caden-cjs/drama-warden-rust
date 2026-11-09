@@ -22,7 +22,7 @@ use tokio::{
 use url::Url;
 
 const MAX_FRAME_BYTES: usize = 24 * 1024 * 1024;
-const DEFAULT_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
