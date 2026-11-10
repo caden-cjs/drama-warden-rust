@@ -396,17 +396,39 @@ export async function quarkMove(src, dest) {
 // 事件只传路径和目标名；FID 在服务端临时解析，避免暴露给前端。
 export async function quarkRenameBatch(items = []) {
   if (!Array.isArray(items) || !items.length) return { ok: true, renamed: [] };
-  const cliItems = [];
+  const groups = new Map();
   for (const item of items) {
     const oldPath = String(item?.path || "");
     const newName = path.basename(String(item?.newName || ""));
     if (!oldPath || !newName || newName === path.posix.basename(oldPath)) continue;
-    const fid = await objectFid(oldPath);
-    cliItems.push({
-      fid,
-      oldName: path.posix.basename(oldPath),
-      newName,
-    });
+    const normalizedPath = path.posix.normalize(oldPath);
+    if (!normalizedPath.startsWith("/") || normalizedPath === "/") {
+      throw new Error("Quark rename path must be an absolute file path");
+    }
+    const directory = path.posix.dirname(normalizedPath);
+    const group = groups.get(directory) || [];
+    group.push({ oldName: path.posix.basename(normalizedPath), newName });
+    groups.set(directory, group);
+  }
+
+  const cliItems = [];
+  for (const [directory, requested] of groups) {
+    // Resolve and enumerate each shared parent once. Resolving each file with
+    // objectFid() repeats a full path traversal and can exceed the plugin
+    // request timeout for a small batch of files in the same season folder.
+    const parentFid = await directoryFid(directory);
+    const listing = await quarkList(parentFid, { limit: 0 });
+    for (const item of requested) {
+      const matches = listing.files.filter((file) => file.name === item.oldName && !file.isDir);
+      if (matches.length !== 1 || !isFid(matches[0].fid)) {
+        throw new Error(`Quark rename source is missing or ambiguous: ${item.oldName}`);
+      }
+      cliItems.push({
+        fid: String(matches[0].fid),
+        oldName: item.oldName,
+        newName: item.newName,
+      });
+    }
   }
   return quarkRenameFids(cliItems);
 }

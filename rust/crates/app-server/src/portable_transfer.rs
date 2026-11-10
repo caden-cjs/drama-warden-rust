@@ -23,6 +23,8 @@ const TABLES: &[&str] = &[
     "subtitle_job",
     "application_setting",
     "plugin_call_log",
+    "plugin_configuration",
+    "plugin_config_audit",
 ];
 
 const VERSION_3_TABLES: &[&str] = &[
@@ -56,6 +58,22 @@ const VERSION_4_TABLES: &[&str] = &[
     "plugin_call_log",
 ];
 
+const VERSION_5_TABLES: &[&str] = &[
+    "shows",
+    "show_metadata_identity",
+    "show_season",
+    "show_episode",
+    "show_episode_metadata",
+    "show_storage",
+    "show_episode_asset",
+    "show_episode_storage",
+    "show_episode_write_claim",
+    "update_event",
+    "subtitle_job",
+    "application_setting",
+    "plugin_call_log",
+];
+
 const MAX_IMPORT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const BINARY_MARKER: &str = "$dramaWardenBinaryV1";
 const PRIMARY_KEYS: &[(&str, &str)] = &[
@@ -72,6 +90,8 @@ const PRIMARY_KEYS: &[(&str, &str)] = &[
     ("subtitle_job", "id"),
     ("application_setting", "setting_key"),
     ("plugin_call_log", "id"),
+    ("plugin_configuration", "plugin_id"),
+    ("plugin_config_audit", "id"),
 ];
 
 struct TableExport<'a> {
@@ -156,7 +176,7 @@ fn validate_snapshot(snapshot: &Value) -> Result<(i64, HashMap<&str, TableExport
     let version = object
         .get("schemaVersion")
         .and_then(Value::as_i64)
-        .filter(|version| [3, 4, 5].contains(version))
+        .filter(|version| [3, 4, 5, 6].contains(version))
         .ok_or_else(|| "unsupported Drama Warden database export schema".to_owned())?;
     if object.get("format").and_then(Value::as_str) != Some("drama-warden-database-export")
         || object.get("formatVersion").and_then(Value::as_i64) != Some(1)
@@ -174,6 +194,7 @@ fn validate_snapshot(snapshot: &Value) -> Result<(i64, HashMap<&str, TableExport
     let expected = match version {
         3 => VERSION_3_TABLES,
         4 => VERSION_4_TABLES,
+        5 => VERSION_5_TABLES,
         _ => TABLES,
     };
     if tables_value.len() != expected.len()
@@ -188,6 +209,14 @@ fn validate_snapshot(snapshot: &Value) -> Result<(i64, HashMap<&str, TableExport
         tables.insert(*table, parse_table(table, &tables_value[*table])?);
     }
     Ok((version, tables))
+}
+
+fn table_optional_for_schema(version: i64, table: &str) -> bool {
+    match table {
+        "plugin_call_log" => version < 4,
+        "plugin_configuration" | "plugin_config_audit" => version < 6,
+        _ => false,
+    }
 }
 
 async fn table_columns<'e, E>(executor: E, driver: &str, table: &str) -> Result<Vec<String>, String>
@@ -459,7 +488,7 @@ pub async fn export_snapshot(pool: &sqlx::AnyPool, driver: &str) -> Result<Value
     Ok(serde_json::json!({
         "format": "drama-warden-database-export",
         "formatVersion": 1,
-        "schemaVersion": 5,
+        "schemaVersion": 6,
         "sourceDriver": driver,
         "exportedAt": portable_timestamp(&exported_at),
         "tables": exported_tables,
@@ -684,7 +713,7 @@ pub async fn import_file(
                     "database export schema does not match target table {table}"
                 ));
             }
-        } else if !(version < 4 && *table == "plugin_call_log") {
+        } else if !table_optional_for_schema(version, table) {
             return Err(format!("database export is missing required table {table}"));
         }
     }
@@ -761,7 +790,9 @@ pub async fn import_file(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_json_column, is_timestamp_column, mysql_tinyint_column};
+    use super::{
+        is_json_column, is_timestamp_column, mysql_tinyint_column, table_optional_for_schema,
+    };
 
     #[test]
     fn mysql_native_columns_with_nonportable_types_are_classified() {
@@ -773,5 +804,16 @@ mod tests {
         assert!(is_json_column("shows", "aliases_json"));
         assert!(is_json_column("application_setting", "value_json"));
         assert!(is_timestamp_column("shows", "created_at"));
+    }
+
+    #[test]
+    fn schema_v5_does_not_require_v6_plugin_configuration_tables() {
+        assert!(table_optional_for_schema(5, "plugin_configuration"));
+        assert!(table_optional_for_schema(5, "plugin_config_audit"));
+        assert!(!table_optional_for_schema(6, "plugin_configuration"));
+        assert!(!table_optional_for_schema(6, "plugin_config_audit"));
+        assert!(table_optional_for_schema(3, "plugin_call_log"));
+        assert!(!table_optional_for_schema(4, "plugin_call_log"));
+        assert!(!table_optional_for_schema(5, "shows"));
     }
 }

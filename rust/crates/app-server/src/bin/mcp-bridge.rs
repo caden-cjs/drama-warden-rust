@@ -178,7 +178,7 @@ async fn handle(
         "notifications/initialized" | "notifications/cancelled" => None,
         "ping" => Some(json!({"jsonrpc":"2.0","id":id,"result":{}})),
         "initialize" => Some(
-            json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":"2025-03-26","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"drama-warden","version":"0.1.0"}}}),
+            json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":"2025-03-26","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"drama-warden","version":"0.1.1"}}}),
         ),
         "tools/list" => {
             let tools: Vec<Value> = TOOLS.iter().map(|(name, description, schema)| json!({"name":name,"description":description,"inputSchema":serde_json::from_str::<Value>(schema).unwrap()})).collect();

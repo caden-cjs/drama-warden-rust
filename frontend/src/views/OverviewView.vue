@@ -16,6 +16,9 @@ const loadError = ref('');
 const openShows = computed(() => shows.value.filter((show) => !show.finished).length);
 const enabledPlugins = computed(() => plugins.value.filter((plugin) => plugin.enabled).length);
 const pendingEvents = computed(() => events.value.filter((event) => event.status === 'pending'));
+const processingEvents = computed(() => events.value.filter((event) => event.status === 'processing'));
+const failedEvents = computed(() => events.value.filter((event) => event.status === 'failed'));
+const uncertainEvents = computed(() => events.value.filter((event) => event.status === 'failed' && !event.retryable));
 const recentEvents = computed(() => events.value.slice(0, 6));
 const scanCandidates = computed(() => scanResult.value?.candidates || []);
 
@@ -82,7 +85,7 @@ onMounted(load);
       <article class="metric-card">
         <div class="metric-top"><span>待处理事件</span><span class="metric-icon amber">↻</span></div>
         <div class="metric-value">{{ pendingEvents.length }}<small> 条</small></div>
-        <div class="metric-foot">最近 {{ events.length }} 条事件记录</div>
+        <div class="metric-foot">处理中 {{ processingEvents.length }} · 最近 {{ events.length }} 条事件</div>
       </article>
       <article class="metric-card">
         <div class="metric-top"><span>已启用插件</span><span class="metric-icon mint">◇</span></div>
@@ -97,6 +100,12 @@ onMounted(load);
         <div class="metric-foot">{{ health?.service || 'drama-warden' }} 服务健康检查</div>
       </article>
     </div>
+
+    <section v-if="failedEvents.length" class="panel dashboard-attention">
+      <div class="attention-mark">!</div>
+      <div class="attention-copy"><strong>{{ failedEvents.length }} 条事件需要关注</strong><span>{{ uncertainEvents.length ? `${uncertainEvents.length} 条需要先核对写入结果` : '可在追更事件中查看失败原因并安全重试' }}</span></div>
+      <span class="status-chip chip-failed">{{ uncertainEvents.length }} 条需核对</span>
+    </section>
 
     <div class="content-grid overview-grid">
       <section class="panel panel-large">
