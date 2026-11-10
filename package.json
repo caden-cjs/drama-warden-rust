@@ -28,7 +28,7 @@
     "update:license-inventory": "node scripts/check-npm-license-inventory.mjs --write-baseline"
   },
   "devDependencies": {
-    "@vitejs/plugin-vue": "^5.2.4",
+    "@vitejs/plugin-vue": "^6.0.10",
     "typescript": "7.0.2",
     "typescript-5.0": "npm:typescript@5.0.4",
     "vite": "^8.3.5",
