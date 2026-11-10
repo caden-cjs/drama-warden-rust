@@ -965,7 +965,7 @@ async fn search_resources(
             "storage is disabled",
         );
     }
-    let limit = input.limit.unwrap_or(10).clamp(1, 20) as usize;
+    let limit = input.limit.unwrap_or(10).clamp(1, 100) as usize;
     if input.limit.is_some_and(|value| value < 1) {
         return api_error(
             StatusCode::BAD_REQUEST,
@@ -1312,7 +1312,7 @@ async fn run_automation_scan(
                         axum::Json(ResourceSearchRequest {
                             storage_id: storage.id,
                             query: None,
-                            limit: Some(5),
+                            limit: Some(100),
                         }),
                     )
                     .await;
@@ -1865,8 +1865,76 @@ struct PluginMoveRequest {
     direction: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PluginConfigRequest {
+    config: serde_json::Value,
+    expected_revision: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PluginConfigRevisionRequest {
+    expected_revision: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PluginConfigValidateRequest {
+    config: serde_json::Value,
+}
+
 async fn list_plugins(State(state): State<AppState>) -> Response {
     axum::Json(serde_json::json!({ "items": state.plugins.list().await })).into_response()
+}
+
+async fn get_plugin_config(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Response, plugins::PluginFailure> {
+    Ok(axum::Json(state.plugins.configuration(&id).await?).into_response())
+}
+
+async fn validate_plugin_config(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::Json(input): axum::Json<PluginConfigValidateRequest>,
+) -> Result<Response, plugins::PluginFailure> {
+    Ok(axum::Json(
+        state
+            .plugins
+            .validate_configuration(&id, &input.config)
+            .await?,
+    )
+    .into_response())
+}
+
+async fn save_plugin_config(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::Json(input): axum::Json<PluginConfigRequest>,
+) -> Result<Response, plugins::PluginFailure> {
+    Ok(axum::Json(
+        state
+            .plugins
+            .save_configuration(&id, &input.config, input.expected_revision)
+            .await?,
+    )
+    .into_response())
+}
+
+async fn reset_plugin_config(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::Json(input): axum::Json<PluginConfigRevisionRequest>,
+) -> Result<Response, plugins::PluginFailure> {
+    Ok(axum::Json(
+        state
+            .plugins
+            .reset_configuration(&id, input.expected_revision)
+            .await?,
+    )
+    .into_response())
 }
 
 async fn reset_plugin(
@@ -2044,6 +2112,16 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .delete(reset_runtime_settings),
         )
         .route("/api/plugins", get(list_plugins))
+        .route(
+            "/api/plugins/{id}/config",
+            get(get_plugin_config)
+                .patch(save_plugin_config)
+                .delete(reset_plugin_config),
+        )
+        .route(
+            "/api/plugins/{id}/config/validate",
+            axum::routing::post(validate_plugin_config),
+        )
         .route("/api/plugins/{id}", axum::routing::put(set_plugin_enabled))
         .route(
             "/api/plugins/{id}/monitor",
@@ -2120,7 +2198,8 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let port = env::var("PORT")
         .unwrap_or_else(|_| "8080".to_owned())
         .parse::<u16>()?;
-    let address = SocketAddr::from(([0, 0, 0, 0], port));
+    let host = env::var("BIND_HOST").unwrap_or_else(|_| "0.0.0.0".to_owned());
+    let address = SocketAddr::new(host.parse()?, port);
     let listener = TcpListener::bind(address).await?;
     info!(address = %address, "drama-warden Rust backend listening");
     tokio::spawn(run_scheduler(state.clone(), runtime_receiver));

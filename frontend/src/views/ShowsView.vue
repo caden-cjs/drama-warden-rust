@@ -10,6 +10,10 @@ const plugins = ref([]);
 const loading = ref(true);
 const loadError = ref('');
 const query = ref('');
+const mediaTypeFilter = ref('all');
+const categoryFilter = ref('all');
+const completionFilter = ref('all');
+const sortMode = ref('name');
 const showCreate = ref(false);
 const showStorageModal = ref(false);
 const creating = ref(false);
@@ -25,6 +29,11 @@ const detailMetadataLoading = ref(false);
 const linkingMetadata = ref(null);
 const detail = ref(null);
 const detailLoading = ref(false);
+const episodeCatalog = ref([]);
+const episodeCatalogStorageId = ref('');
+const episodeCatalogLoading = ref(false);
+const episodeCatalogError = ref('');
+const episodeSeasonFilter = ref('all');
 const storageScanId = ref(null);
 const resourceQuery = ref('');
 const resourceResults = ref([]);
@@ -34,20 +43,52 @@ const selectedCandidate = ref(null);
 const followupPreview = ref(null);
 const followupLoading = ref(false);
 const queueing = ref(false);
-const createForm = ref({ name: '', mediaType: 'tv', aliases: '' });
+const createForm = ref({ name: '', mediaType: 'tv', category: 'tv', aliases: '' });
 const storageForm = ref({ providerId: '', rootPath: '' });
 let detailRequestId = 0;
 
 const visibleShows = computed(() => {
   const needle = query.value.trim().toLowerCase();
-  if (!needle) return shows.value;
-  return shows.value.filter((show) =>
-    show.name.toLowerCase().includes(needle)
-      || (show.aliases || []).some((alias) => alias.toLowerCase().includes(needle)));
+  return shows.value.filter((show) => {
+    if (mediaTypeFilter.value !== 'all' && show.mediaType !== mediaTypeFilter.value) return false;
+    if (categoryFilter.value !== 'all' && (show.category || 'tv') !== categoryFilter.value) return false;
+    if (completionFilter.value === 'watching' && show.finished) return false;
+    if (completionFilter.value === 'finished' && !show.finished) return false;
+    return !needle || show.name.toLowerCase().includes(needle)
+      || (show.aliases || []).some((alias) => alias.toLowerCase().includes(needle));
+  }).sort((a, b) => sortMode.value === 'name'
+    ? a.name.localeCompare(b.name, 'zh-CN')
+    : String(b.updatedAt || b.createdAt || '').localeCompare(String(a.updatedAt || a.createdAt || '')));
 });
+const watchingCount = computed(() => shows.value.filter((show) => !show.finished).length);
+const finishedCount = computed(() => shows.value.filter((show) => show.finished).length);
+function categoryLabel(show) {
+  return ({ tv: '电视剧', anime: '动漫', variety: '综艺' })[show.category] || mediaTypeLabel(show.mediaType);
+}
 const storagePlugins = computed(() => plugins.value.filter((plugin) =>
   plugin.enabled && (plugin.storageContract || plugin.capabilities?.includes('listSharedFiles'))));
 const discoveryStorage = computed(() => detail.value?.storages.find((storage) => storage.enabled) || null);
+const catalogStorages = computed(() => detail.value?.storages || []);
+const catalogSummary = computed(() => {
+  const episodes = episodeCatalog.value;
+  return {
+    total: episodes.length,
+    present: episodes.filter((episode) => episode.status === 'present').length,
+    missing: episodes.filter((episode) => episode.status === 'missing').length,
+    conflict: episodes.filter((episode) => episode.status === 'conflict' || episode.assetCount > 1).length,
+  };
+});
+const catalogSeasons = computed(() => [...new Set(episodeCatalog.value.map((episode) => episode.seasonNumber))].sort((a, b) => a - b));
+const visibleCatalogEpisodes = computed(() => episodeCatalog.value.filter((episode) =>
+  episodeSeasonFilter.value === 'all' || episode.seasonNumber === Number(episodeSeasonFilter.value)));
+const catalogSeasonGroups = computed(() => {
+  const groups = new Map();
+  for (const episode of visibleCatalogEpisodes.value) {
+    if (!groups.has(episode.seasonNumber)) groups.set(episode.seasonNumber, []);
+    groups.get(episode.seasonNumber).push(episode);
+  }
+  return [...groups.entries()].map(([seasonNumber, episodes]) => ({ seasonNumber, episodes }));
+});
 
 async function load() {
   loading.value = true;
@@ -67,12 +108,31 @@ async function load() {
 }
 
 function openCreate() {
-  createForm.value = { name: '', mediaType: 'tv', aliases: '' };
+  createForm.value = { name: '', mediaType: 'tv', category: 'tv', aliases: '' };
   metadataQuery.value = '';
   metadataResults.value = [];
   metadataProviders.value = [];
   selectedMetadata.value = null;
   showCreate.value = true;
+}
+
+async function loadEpisodeCatalog(storageId = episodeCatalogStorageId.value) {
+  if (!detail.value || !storageId) {
+    episodeCatalog.value = [];
+    return;
+  }
+  episodeCatalogStorageId.value = String(storageId);
+  episodeCatalogLoading.value = true;
+  episodeCatalogError.value = '';
+  try {
+    const response = await api.request(`/api/shows/${detail.value.show.id}/storages/${storageId}/episodes`);
+    episodeCatalog.value = response.items || [];
+  } catch (error) {
+    episodeCatalog.value = [];
+    episodeCatalogError.value = errorMessage(error);
+  } finally {
+    episodeCatalogLoading.value = false;
+  }
 }
 
 async function searchMetadata() {
@@ -106,6 +166,7 @@ async function createShow() {
     const body = {
       name,
       mediaType: createForm.value.mediaType,
+      category: createForm.value.category,
       aliases: createForm.value.aliases.split(/[\n,，]/).map((item) => item.trim()).filter(Boolean),
     };
     const response = await api.request('/api/shows', { method: 'POST', body });
@@ -155,6 +216,12 @@ async function openDetails(show) {
       identities: showResponse.metadataIdentities || [],
       storages: storageResponse.items || [],
     };
+    episodeCatalog.value = [];
+    episodeCatalogError.value = '';
+    episodeSeasonFilter.value = 'all';
+    const firstStorage = (storageResponse.items || []).find((storage) => storage.enabled) || storageResponse.items?.[0];
+    episodeCatalogStorageId.value = firstStorage ? String(firstStorage.id) : '';
+    if (firstStorage) await loadEpisodeCatalog(firstStorage.id);
     resourceQuery.value = show.name;
     storageForm.value = { providerId: storagePlugins.value[0]?.id || '', rootPath: `/shows/${show.name.replaceAll('/', '-')}` };
   } catch (error) {
@@ -167,6 +234,8 @@ async function openDetails(show) {
 function closeDetails() {
   detailRequestId += 1;
   detail.value = null;
+  episodeCatalog.value = [];
+  episodeCatalogStorageId.value = '';
   detailLoading.value = false;
 }
 
@@ -238,7 +307,17 @@ async function scanStorage(storage) {
     notify(count == null ? '存储扫描完成。' : `扫描完成，读取到 ${count} 个媒体资产。`);
     await refreshDetail();
   } catch (error) {
-    notify(errorMessage(error), 'error');
+    const message = error?.code === 'QUARK_AUTH_FAILED' || error?.code === 'PAN115_AUTH_FAILED'
+      ? `${storage.providerId === 'pan115' ? '115' : '夸克'}授权已失效，请完成官方客户端登录后重新扫描。`
+      : error?.code === 'QUARK_LIST_FAILED'
+        ? '夸克目录读取失败，请在插件管理页检查授权状态和 CLI 配置后重新扫描。'
+      : error?.code === 'STORAGE_PATH_NOT_FOUND'
+        ? `${storage.providerId === 'pan115' ? '115' : '网盘'}目录不存在：${storage.rootPath}。请改为网盘中实际存在的目录路径后重新扫描。`
+        : error?.code === 'PAN115_CLI_UNAVAILABLE'
+          ? '115 CLI 不可用，请检查本机 115 CLI 安装和配置路径。'
+          : errorMessage(error);
+    episodeCatalogError.value = message;
+    notify(message, 'error');
   } finally {
     storageScanId.value = null;
   }
@@ -274,10 +353,25 @@ async function previewCandidate(candidate, storageId) {
     });
     followupPreview.value = response.preview;
   } catch (error) {
-    notify(errorMessage(error), 'error');
+    notify(previewFailureLabel(error?.code) || errorMessage(error), 'error');
   } finally {
     followupLoading.value = false;
   }
+}
+
+function previewFailureLabel(code) {
+  return ({
+    QUARK_SHARE_UNAVAILABLE: '这个夸克分享链接已失效或不可访问，请换一个候选。',
+    QUARK_SHARE_PASSCODE_INVALID: '这个夸克分享的提取码缺失或不正确。',
+    QUARK_SHARE_RATE_LIMITED: '夸克暂时限制了分享查询，请稍后重试。',
+    STORAGE_PATH_NOT_FOUND: '网盘目录不存在，请检查当前存储位置配置。',
+  })[code] || null;
+}
+
+function candidatePreviewLabel(candidate) {
+  const preview = candidate?.preview;
+  if (preview?.eligible) return '预览可追更';
+  return previewFailureLabel(preview?.errorCode) || preview?.reason || '需要复核';
 }
 
 async function queueFollowup() {
@@ -327,9 +421,21 @@ onMounted(load);
       <button class="button button-primary" type="button" @click="openCreate"><span>＋</span> 添加节目</button>
     </div>
 
+    <div class="show-library-summary">
+      <div><span>节目总数</span><strong>{{ shows.length }}</strong></div>
+      <div><span>追更中</span><strong>{{ watchingCount }}</strong></div>
+      <div><span>已完结</span><strong>{{ finishedCount }}</strong></div>
+    </div>
+
     <section class="panel toolbar-panel">
       <div class="search-field"><span aria-hidden="true">⌕</span><input v-model="query" type="search" placeholder="搜索节目或别名" /></div>
-      <div class="toolbar-actions"><span class="subtle-count">{{ visibleShows.length }} 部节目</span><button class="icon-button small" type="button" title="刷新节目列表" @click="load">⟳</button></div>
+      <div class="show-list-controls">
+        <select v-model="mediaTypeFilter" class="form-control" aria-label="媒体类型"><option value="all">全部媒体类型</option><option value="tv">剧集</option><option value="movie">电影</option></select>
+        <select v-model="categoryFilter" class="form-control" aria-label="节目分类"><option value="all">全部分类</option><option value="tv">电视剧</option><option value="anime">动漫</option><option value="variety">综艺</option></select>
+        <select v-model="completionFilter" class="form-control" aria-label="追更状态"><option value="all">全部状态</option><option value="watching">追更中</option><option value="finished">已完结</option></select>
+        <select v-model="sortMode" class="form-control" aria-label="排序方式"><option value="name">按名称</option><option value="updated">最近更新</option></select>
+        <span class="subtle-count">显示 {{ visibleShows.length }} / {{ shows.length }}</span><button class="icon-button small" type="button" title="刷新节目列表" @click="load">⟳</button>
+      </div>
     </section>
 
     <div v-if="loadError" class="inline-alert error-alert"><span class="alert-symbol">!</span><div><strong>节目列表加载失败</strong><p>{{ loadError }}</p></div></div>
@@ -341,7 +447,7 @@ onMounted(load);
     </div>
     <div v-else class="show-grid">
       <button v-for="show in visibleShows" :key="show.id" class="show-card" type="button" @click="openDetails(show)">
-        <div class="show-card-top"><div class="poster-placeholder"><span>{{ (show.name || '?').slice(0, 1) }}</span></div><span class="show-type">{{ mediaTypeLabel(show.mediaType) }}</span></div>
+        <div class="show-card-top"><div class="poster-placeholder"><span>{{ (show.name || '?').slice(0, 1) }}</span></div><span class="show-type">{{ categoryLabel(show) }}</span></div>
         <div class="show-card-copy"><h3>{{ show.name }}</h3><div v-if="show.aliases?.length" class="show-alias">{{ show.aliases.slice(0, 2).join(' · ') }}</div><div class="show-card-footer"><span class="status-dot" :class="show.finished ? 'finished' : 'watching'"></span>{{ show.finished ? '已完结' : '追更中' }}<span class="show-id">#{{ show.id }}</span></div></div>
         <span class="show-arrow" aria-hidden="true">↗</span>
       </button>
@@ -353,6 +459,7 @@ onMounted(load);
           <div class="modal-heading"><div><span class="modal-kicker">节目库 / 新建</span><h2 id="create-show-title">添加节目</h2><p>选择元数据候选可以自动带入节目名称并建立来源关联。</p></div><button class="icon-button" type="button" aria-label="关闭" @click="showCreate = false">×</button></div>
           <form class="form-stack" @submit.prevent="createShow">
             <div class="form-row two-columns"><label class="field"><span>节目名称</span><input v-model="createForm.name" required maxlength="255" placeholder="例如：星际牛仔" /></label><label class="field"><span>媒体类型</span><select v-model="createForm.mediaType"><option value="tv">剧集</option><option value="movie">电影</option></select></label></div>
+            <label v-if="createForm.mediaType === 'tv'" class="field"><span>节目分类</span><select v-model="createForm.category"><option value="tv">电视剧</option><option value="anime">动漫</option><option value="variety">综艺</option></select></label>
             <label class="field"><span>别名 <small>选填，用逗号分隔</small></span><input v-model="createForm.aliases" placeholder="英文名、其他译名" /></label>
             <div class="section-rule"><span>元数据关联</span></div>
             <div class="inline-search"><input v-model="metadataQuery" placeholder="搜索 TMDB / TVmaze" @keydown.enter.prevent="searchMetadata" /><button class="button button-secondary" type="button" :disabled="searchingMetadata || !metadataQuery.trim()" @click="searchMetadata">{{ searchingMetadata ? '搜索中…' : '搜索' }}</button></div>
@@ -374,10 +481,46 @@ onMounted(load);
         <section v-if="detail" class="detail-drawer" role="dialog" aria-modal="true" :aria-labelledby="`show-title-${detail.show.id}`">
           <div class="detail-heading"><button class="icon-button" type="button" aria-label="关闭" @click="closeDetails">←</button><div class="detail-heading-copy"><span class="modal-kicker">节目详情 / #{{ detail.show.id }}</span><h2 :id="`show-title-${detail.show.id}`">{{ detail.show.name }}</h2></div><button class="icon-button" type="button" aria-label="刷新详情" @click="refreshDetail">⟳</button></div>
           <div class="detail-scroll">
-            <div class="detail-summary-card"><div class="poster-placeholder poster-large"><span>{{ detail.show.name.slice(0, 1) }}</span></div><div><span class="status-dot" :class="detail.show.finished ? 'finished' : 'watching'"></span><strong>{{ detail.show.finished ? '已完结' : '追更中' }}</strong><p>{{ mediaTypeLabel(detail.show.mediaType) }} · 添加于 {{ formatDate(detail.show.createdAt) }}</p><small v-if="detail.show.aliases?.length">别名：{{ detail.show.aliases.join('、') }}</small></div></div>
+            <div class="detail-summary-card"><div class="poster-placeholder poster-large"><span>{{ detail.show.name.slice(0, 1) }}</span></div><div><span class="status-dot" :class="detail.show.finished ? 'finished' : 'watching'"></span><strong>{{ detail.show.finished ? '已完结' : '追更中' }}</strong><p>{{ categoryLabel(detail.show) }} · 添加于 {{ formatDate(detail.show.createdAt) }}</p><small v-if="detail.show.aliases?.length">别名：{{ detail.show.aliases.join('、') }}</small></div></div>
             <section class="detail-section"><div class="section-heading"><div><h3>元数据来源</h3><p>用于确认季集清单和缺集计划</p></div><span class="subtle-count">{{ detail.identities.length }} 个</span></div><div v-if="!detail.identities.length" class="detail-empty">尚未关联元数据。搜索节目候选并明确选择对应的来源。</div><div v-else class="identity-list"><div v-for="identity in detail.identities" :key="identity.id" class="identity-row"><span class="identity-logo">{{ identity.providerId.slice(0, 1).toUpperCase() }}</span><div><strong>{{ identity.providerId }}</strong><small>{{ identity.mediaType }} · 外部 ID {{ identity.externalId }}</small></div><span class="identity-date">{{ formatDate(identity.linkedAt) }}</span></div></div><div class="inline-search detail-metadata-search"><input v-model="detailMetadataQuery" placeholder="搜索其他元数据来源" @keydown.enter.prevent="searchDetailMetadata" /><button class="button button-secondary" type="button" :disabled="detailMetadataLoading || !detailMetadataQuery.trim()" @click="searchDetailMetadata">{{ detailMetadataLoading ? '搜索中…' : '搜索' }}</button></div><div v-if="detailMetadataResults.length" class="metadata-results detail-candidates"><div v-for="candidate in detailMetadataResults" :key="`${candidate.providerId}-${candidate.externalId}`" class="metadata-result"><span class="metadata-result-main"><strong>{{ candidate.name }}</strong><small>{{ candidate.providerId }} · {{ candidate.year || candidate.firstAirDate || '年份未知' }}</small></span><button class="button button-quiet button-small" type="button" :disabled="linkingMetadata === candidate" @click="linkDetailMetadata(candidate)">{{ linkingMetadata === candidate ? '关联中…' : '关联' }}</button></div></div></section>
             <section class="detail-section"><div class="section-heading"><div><h3>媒体库位置</h3><p>扫描会读取目录并同步集资产</p></div><button class="button button-secondary button-small" type="button" @click="startAddStorage">＋ 添加位置</button></div><div v-if="!detail.storages.length" class="detail-empty">还没有配置存储位置。启用本地存储插件后，可以添加一个媒体目录。</div><div v-else class="storage-list"><div v-for="storage in detail.storages" :key="storage.id" class="storage-row"><div class="storage-icon">▤</div><div class="storage-copy"><strong>{{ storage.rootPath }}</strong><small>{{ storage.providerId }} · {{ storage.enabled ? '已启用' : '已停用' }}</small></div><button class="button button-quiet button-small" type="button" :disabled="storageScanId === storage.id || !storage.enabled" @click="scanStorage(storage)">{{ storageScanId === storage.id ? '扫描中…' : '扫描目录' }}</button></div></div></section>
-            <section v-if="detail.show.mediaType === 'tv'" class="detail-section followup-section"><div class="section-heading"><div><h3>资源候选</h3><p>搜索并预览，不会直接转存媒体</p></div></div><div v-if="!detail.storages.length" class="detail-empty">先添加存储位置，再搜索资源候选。</div><div v-else-if="!discoveryStorage" class="detail-empty">当前存储位置都已停用，请先在服务端启用一个位置。</div><template v-else><div class="inline-search resource-search"><input v-model="resourceQuery" placeholder="资源搜索关键词" @keydown.enter.prevent="searchResources(discoveryStorage.id)" /><button class="button button-secondary" type="button" :disabled="resourceLoading" @click="searchResources(discoveryStorage.id)">{{ resourceLoading ? '搜索中…' : '搜索资源' }}</button></div><div v-if="resourceProviders.length" class="provider-summary">{{ resourceProviders.map((item) => `${item.providerId}${item.ok ? '' : '（失败）'}`).join(' · ') }}</div><div v-if="resourceResults.length" class="resource-results"><article v-for="(candidate, index) in resourceResults" :key="candidate.sourceId || index" class="resource-card" :class="{ chosen: selectedCandidate === candidate }"><div><strong>{{ candidate.title || '未命名资源' }}</strong><small>{{ candidate.providerId }} · {{ candidate.preview?.eligible ? '预览可追更' : candidate.preview?.reason || '需要复核' }}</small></div><button class="button button-quiet button-small" type="button" :disabled="followupLoading" @click="previewCandidate(candidate, discoveryStorage.id)">{{ selectedCandidate === candidate && followupLoading ? '预览中…' : '预览' }}</button></article></div><div v-if="followupPreview" class="preview-card" :class="followupPreview.eligible ? 'preview-good' : 'preview-muted'"><div class="preview-head"><strong>{{ followupPreview.eligible ? '确认到可追集内容' : '当前无法追更' }}</strong><span>{{ followupPreview.reason || '计划已生成' }}</span></div><p v-if="followupPreview.plan">S{{ String(followupPreview.plan.seasonNumber).padStart(2, '0') }} · 本次选择 {{ followupPreview.plan.saveBatch?.length || 0 }} 集<span v-if="followupPreview.plan.deferredCount">，另有 {{ followupPreview.plan.deferredCount }} 集留待后续</span></p><div v-if="followupPreview.plan?.saveBatch?.length" class="episode-chips"><span v-for="file in followupPreview.plan.saveBatch" :key="file.fileId || file.id || file.episodeNumber">E{{ String(file.episodeNumber || file.episode || '?').padStart(2, '0') }}</span></div><button v-if="followupPreview.eligible" class="button button-primary button-full" type="button" :disabled="queueing" @click="queueFollowup">{{ queueing ? '正在加入…' : '加入追更队列' }}</button><small v-if="followupPreview.eligible" class="helper-note">加入队列只创建待处理事件，不会写入媒体文件。</small></div></template></section><section v-else class="detail-section"><div class="section-heading"><div><h3>资源候选</h3><p>当前资源追更流程针对剧集设计</p></div></div><div class="detail-empty">电影的资源追踪和存储流程尚未实现。</div></section>
+            <section class="detail-section episode-catalog-section">
+              <div class="section-heading catalog-heading">
+                <div><h3>逐集入库目录</h3><p>最近一次存储扫描的数据库快照，不会在打开详情时重新扫描</p></div>
+                <div class="catalog-controls">
+                  <select v-if="catalogStorages.length > 1" v-model="episodeCatalogStorageId" class="form-control" aria-label="选择存储位置" @change="loadEpisodeCatalog()">
+                    <option v-for="storage in catalogStorages" :key="storage.id" :value="String(storage.id)">{{ providerTitle(plugins.find((plugin) => plugin.id === storage.providerId) || { id: storage.providerId }) }} · {{ storage.rootPath }}</option>
+                  </select>
+                  <select v-if="catalogSeasons.length > 1" v-model="episodeSeasonFilter" class="form-control" aria-label="按季筛选">
+                    <option value="all">全部季</option><option v-for="season in catalogSeasons" :key="season" :value="String(season)">第 {{ season }} 季</option>
+                  </select>
+                  <button class="button button-quiet button-small" type="button" :disabled="episodeCatalogLoading || !episodeCatalogStorageId" @click="loadEpisodeCatalog()">{{ episodeCatalogLoading ? '读取中…' : '刷新目录' }}</button>
+                </div>
+              </div>
+              <div v-if="episodeCatalogError" class="inline-alert error-alert"><span class="alert-symbol">!</span><div><strong>目录读取失败</strong><p>{{ episodeCatalogError }}</p></div></div>
+              <div v-else-if="!catalogStorages.length" class="detail-empty">先添加存储位置并扫描目录，逐集进度才会显示在这里。</div>
+              <div v-else-if="episodeCatalogLoading && !episodeCatalog.length" class="catalog-loading"><div class="spinner"></div><span>正在读取已保存的目录快照</span></div>
+              <div v-else-if="!episodeCatalog.length" class="detail-empty">暂无逐集快照。点击上方存储位置中的“扫描目录”后再刷新。</div>
+              <template v-else>
+                <div class="catalog-summary">
+                  <div><strong>{{ catalogSummary.present }}</strong><span>已入库</span></div>
+                  <div><strong>{{ catalogSummary.missing }}</strong><span>缺失</span></div>
+                  <div><strong>{{ catalogSummary.conflict }}</strong><span>多版本待核对</span></div>
+                  <div><strong>{{ catalogSummary.total }}</strong><span>目录集数</span></div>
+                </div>
+                <div class="catalog-progress"><span :style="{ width: `${catalogSummary.total ? Math.round(catalogSummary.present / catalogSummary.total * 100) : 0}%` }"></span></div>
+                <div v-for="group in catalogSeasonGroups" :key="group.seasonNumber" class="catalog-season-group">
+                  <h4 v-if="catalogSeasons.length > 1 && episodeSeasonFilter === 'all'">第 {{ group.seasonNumber }} 季</h4>
+                  <div class="episode-grid">
+                    <div v-for="episode in group.episodes" :key="`${episode.seasonNumber}-${episode.episodeNumber}`" class="episode-cell" :class="`episode-${episode.status}`" :title="`${episode.assetCount} 个文件${episode.scannedAt ? ` · 扫描于 ${formatDate(episode.scannedAt)}` : ''}`">
+                      <strong>E{{ String(episode.episodeNumber).padStart(2, '0') }}</strong>
+                      <small>{{ episode.status === 'present' ? '已入库' : episode.status === 'conflict' || episode.assetCount > 1 ? `${episode.assetCount} 个版本` : '缺失' }}</small>
+                    </div>
+                  </div>
+                </div>
+              </template>
+            </section>
+            <section v-if="detail.show.mediaType === 'tv'" class="detail-section followup-section"><div class="section-heading"><div><h3>资源候选</h3><p>搜索并预览，不会直接转存媒体</p></div></div><div v-if="!detail.storages.length" class="detail-empty">先添加存储位置，再搜索资源候选。</div><div v-else-if="!discoveryStorage" class="detail-empty">当前存储位置都已停用，请先在服务端启用一个位置。</div><template v-else><div class="inline-search resource-search"><input v-model="resourceQuery" placeholder="资源搜索关键词" @keydown.enter.prevent="searchResources(discoveryStorage.id)" /><button class="button button-secondary" type="button" :disabled="resourceLoading" @click="searchResources(discoveryStorage.id)">{{ resourceLoading ? '搜索中…' : '搜索资源' }}</button></div><div v-if="resourceProviders.length" class="provider-summary">{{ resourceProviders.map((item) => `${item.providerId}${item.ok ? '' : '（失败）'}`).join(' · ') }}</div><div v-if="resourceResults.length" class="resource-results"><article v-for="(candidate, index) in resourceResults" :key="candidate.sourceId || index" class="resource-card" :class="{ chosen: selectedCandidate === candidate }"><div><strong>{{ candidate.title || '未命名资源' }}</strong><small>{{ candidate.providerId }} · {{ candidatePreviewLabel(candidate) }}</small></div><button class="button button-quiet button-small" type="button" :disabled="followupLoading" @click="previewCandidate(candidate, discoveryStorage.id)">{{ selectedCandidate === candidate && followupLoading ? '预览中…' : '预览' }}</button></article></div><div v-if="followupPreview" class="preview-card" :class="followupPreview.eligible ? 'preview-good' : 'preview-muted'"><div class="preview-head"><strong>{{ followupPreview.eligible ? '确认到可追集内容' : '当前无法追更' }}</strong><span>{{ followupPreview.reason || '计划已生成' }}</span></div><p v-if="followupPreview.plan">S{{ String(followupPreview.plan.seasonNumber).padStart(2, '0') }} · 本次选择 {{ followupPreview.plan.saveBatch?.length || 0 }} 集<span v-if="followupPreview.plan.deferredCount">，另有 {{ followupPreview.plan.deferredCount }} 集留待后续</span></p><div v-if="followupPreview.plan?.saveBatch?.length" class="episode-chips"><span v-for="file in followupPreview.plan.saveBatch" :key="file.fileId || file.id || file.episodeNumber">E{{ String(file.episodeNumber || file.episode || '?').padStart(2, '0') }}</span></div><button v-if="followupPreview.eligible" class="button button-primary button-full" type="button" :disabled="queueing" @click="queueFollowup">{{ queueing ? '正在加入…' : '加入追更队列' }}</button><small v-if="followupPreview.eligible" class="helper-note">加入队列只创建待处理事件，不会写入媒体文件。</small></div></template></section><section v-else class="detail-section"><div class="section-heading"><div><h3>资源候选</h3><p>当前资源追更流程针对剧集设计</p></div></div><div class="detail-empty">电影的资源追踪和存储流程尚未实现。</div></section>
           </div>
         </section>
         <section v-else class="modal loading-modal"><div class="spinner"></div><strong>正在加载节目详情</strong></section>

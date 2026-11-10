@@ -307,6 +307,9 @@ async fn process_inner(
     let storage = episodes::get_storage(pool, event.show_id, storage_id, mysql)
         .await
         .map_err(|_| fail("STORAGE_NOT_FOUND", context))?;
+    let metadata_episodes = episodes::list_episode_metadata(pool, event.show_id, season_number)
+        .await
+        .map_err(|_| fail("DATABASE_ERROR", context))?;
     if !storage.enabled || storage.provider_id != provider_id {
         return Err(fail("STORAGE_CONFIGURATION_CHANGED", context));
     }
@@ -373,9 +376,15 @@ async fn process_inner(
                         .get("path")
                         .and_then(Value::as_str)
                         .is_some_and(|path| {
-                            let parsed = basename(file)
-                                .and_then(|name| super::followup_plan::parse_video_episode(&name));
-                            parsed.is_some_and(|(season, episode, _)| {
+                            let parsed = basename(file).and_then(|name| {
+                                let season = super::followup_plan::video_season_number(&name)?;
+                                let episode = super::followup_plan::selected_episode_number(
+                                    &name,
+                                    &metadata_episodes,
+                                )?;
+                                Some((season, episode))
+                            });
+                            parsed.is_some_and(|(season, episode)| {
                                 season == season_number && episode == episode_number
                             }) && !path.is_empty()
                         })
@@ -787,7 +796,7 @@ pub async fn recover_event(
     let destination = join_path(&storage.root_path, &format!("Season {season_number:02}"))
         .map_err(recovery_error)?;
     let mut files;
-    if plugin.capabilities.iter().any(|name| name == "mkdir") {
+    if input.action == "complete" && plugin.capabilities.iter().any(|name| name == "mkdir") {
         invoke(
             plugins,
             &provider_id,

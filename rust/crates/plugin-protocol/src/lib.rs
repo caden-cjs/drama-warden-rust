@@ -58,6 +58,44 @@ pub struct ConfigField {
     pub field_type: String,
     #[serde(default)]
     pub required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<bool>,
+    #[serde(default = "default_config_scope")]
+    pub scope: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<ConfigOption>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placeholder: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+}
+
+impl ConfigField {
+    pub fn is_secret(&self) -> bool {
+        self.secret.unwrap_or(self.field_type == "password")
+    }
+}
+
+fn default_config_scope() -> String {
+    "runtime".to_owned()
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigOption {
+    pub value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -141,12 +179,45 @@ impl PluginManifest {
             return Err("unsupported plugin configuration schema version");
         }
         let mut keys = std::collections::HashSet::new();
-        if self.config_schema.fields.iter().any(|field| {
-            !valid_identifier(&field.key)
-                || !["text", "url", "password"].contains(&field.field_type.as_str())
+        for field in &self.config_schema.fields {
+            if !valid_identifier(&field.key)
+                || ![
+                    "text", "url", "path", "password", "boolean", "integer", "select",
+                ]
+                .contains(&field.field_type.as_str())
                 || !keys.insert(field.key.as_str())
-        }) {
-            return Err("plugin configuration fields are invalid");
+                || !["runtime", "deployment"].contains(&field.scope.as_str())
+                || field.is_secret() && field.field_type != "password"
+                || field.is_secret() && field.default.is_some()
+                || field.label.as_ref().is_some_and(|value| value.len() > 120)
+                || field
+                    .description
+                    .as_ref()
+                    .is_some_and(|value| value.len() > 500)
+                || field
+                    .placeholder
+                    .as_ref()
+                    .is_some_and(|value| value.len() > 160)
+                || field.group.as_ref().is_some_and(|value| value.len() > 80)
+                || field.min.zip(field.max).is_some_and(|(min, max)| min > max)
+                || field.options.len() > 100
+            {
+                return Err("plugin configuration fields are invalid");
+            }
+            if field.field_type == "select" && field.options.is_empty() {
+                return Err("select plugin fields require options");
+            }
+            if field.field_type != "select" && !field.options.is_empty() {
+                return Err("only select plugin fields may declare options");
+            }
+            let mut option_values = std::collections::HashSet::new();
+            if field.options.iter().any(|option| {
+                option.value.len() > 160
+                    || option.label.as_ref().is_some_and(|value| value.len() > 160)
+                    || !option_values.insert(option.value.as_str())
+            }) {
+                return Err("plugin configuration options are invalid");
+            }
         }
         let mut capabilities = std::collections::HashSet::new();
         if self

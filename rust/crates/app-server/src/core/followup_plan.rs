@@ -34,7 +34,24 @@ fn positive_integer(value: &Value) -> Option<i64> {
     (number > 0).then_some(number)
 }
 
+fn strip_leading_release_date(name: &str) -> &str {
+    let bytes = name.as_bytes();
+    if bytes.len() < 10
+        || !bytes[..4].iter().all(u8::is_ascii_digit)
+        || !matches!(bytes[4], b'-' | b'.' | b'_')
+        || bytes[7] != bytes[4]
+        || !bytes[5..7].iter().all(u8::is_ascii_digit)
+        || !bytes[8..10].iter().all(u8::is_ascii_digit)
+        || (bytes.len() > 10
+            && !(bytes[10].is_ascii_whitespace() || matches!(bytes[10], b'_' | b'.')))
+    {
+        return name;
+    }
+    name[10..].trim_start_matches(|ch: char| ch.is_ascii_whitespace() || matches!(ch, '_' | '.'))
+}
+
 fn episode_number(name: &str) -> Option<i64> {
+    let name = strip_leading_release_date(name);
     let lower = name.to_ascii_lowercase();
     let bytes = lower.as_bytes();
     for index in 0..bytes.len() {
@@ -84,6 +101,63 @@ fn episode_number(name: &str) -> Option<i64> {
     None
 }
 
+fn episode_part(name: &str) -> Option<char> {
+    let index = name.find('第')?;
+    let tail = &name[index + '第'.len_utf8()..];
+    let digits: String = tail.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    let rest = &tail[digits.len()..];
+    let part_start = if rest.starts_with('集') || rest.starts_with('期') {
+        rest.chars().next()?.len_utf8()
+    } else {
+        return None;
+    };
+    let suffix = rest[part_start..].trim_start_matches(|ch: char| ch.is_ascii_whitespace());
+    let suffix = suffix
+        .strip_prefix('（')
+        .or_else(|| suffix.strip_prefix('('))
+        .unwrap_or(suffix);
+    match suffix.chars().next()? {
+        part @ ('上' | '下') => Some(part),
+        _ => None,
+    }
+}
+
+fn metadata_episode_part(item: &Value) -> Option<(i64, i64)> {
+    let name = item.get("name")?.as_str()?.to_ascii_lowercase();
+    let start = name.find("episode ")? + "episode ".len();
+    let value = &name[start..];
+    let (issue, part) = value.split_once('-')?;
+    let issue = issue.trim().parse::<i64>().ok()?;
+    let part = part
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse::<i64>()
+        .ok()?;
+    (issue > 0 && part > 0).then_some((issue, part))
+}
+
+pub fn selected_episode_number(name: &str, metadata_episodes: &[Value]) -> Option<i64> {
+    let issue_number = episode_number(name)?;
+    let Some(part) = episode_part(name) else {
+        return Some(issue_number);
+    };
+    let part_number = match part {
+        '上' => 1,
+        '下' => 2,
+        _ => return None,
+    };
+    let matches = metadata_episodes
+        .iter()
+        .filter(|item| metadata_episode_part(item) == Some((issue_number, part_number)))
+        .filter_map(|item| item.get("episodeNumber").and_then(positive_integer))
+        .collect::<BTreeSet<_>>();
+    (matches.len() == 1).then(|| *matches.first().unwrap())
+}
+
 fn digits_at(bytes: &[u8], mut index: usize) -> Option<i64> {
     let start = index;
     while index < bytes.len() && bytes[index].is_ascii_digit() {
@@ -125,6 +199,24 @@ fn video_file(name: &str) -> bool {
     .any(|extension| lower.ends_with(extension))
 }
 
+fn non_canonical_extra(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    [
+        "抢鲜",
+        "抢先",
+        "沉浸版",
+        "加更版",
+        "番外",
+        "预览",
+        "预告",
+        "花絮",
+        "preview",
+        "trailer",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
 pub fn video_season_number(name: &str) -> Option<i64> {
     video_file(name).then(|| named_season(name).unwrap_or(1))
 }
@@ -161,7 +253,12 @@ pub fn parse_video_episode(name: &str) -> Option<(i64, i64, Option<String>)> {
     (episode > 0).then(|| (season, episode, quality(name).map(|(label, _)| label)))
 }
 
-fn select_files(files: &[Value], wanted: &[i64], season: i64) -> Vec<SelectedFile> {
+fn select_files(
+    files: &[Value],
+    wanted: &[i64],
+    season: i64,
+    metadata_episodes: &[Value],
+) -> Vec<SelectedFile> {
     let wanted: HashSet<i64> = wanted.iter().copied().collect();
     let mut best: BTreeMap<i64, (SelectedFile, u8)> = BTreeMap::new();
     for file in files {
@@ -179,12 +276,15 @@ fn select_files(files: &[Value], wanted: &[i64], season: i64) -> Vec<SelectedFil
             _ => continue,
         };
         if !video_file(name)
+            || non_canonical_extra(name)
             || named_season(name).is_some_and(|value| value != season)
             || (named_season(name).is_none() && season != 1)
         {
             continue;
         }
-        let Some(number) = episode_number(name).filter(|number| wanted.contains(number)) else {
+        let Some(number) = selected_episode_number(name, metadata_episodes)
+            .filter(|number| wanted.contains(number))
+        else {
             continue;
         };
         let raw_size = file.get("size").and_then(Value::as_u64).unwrap_or(0);
@@ -283,7 +383,7 @@ pub fn create_plan(
             (*status == "missing" && *future).then_some(*number)
         })
         .collect::<Vec<_>>();
-    let available_future = select_files(shared_files, &future_missing, season)
+    let available_future = select_files(shared_files, &future_missing, season, metadata_episodes)
         .into_iter()
         .map(|file| file.episode_number)
         .collect::<Vec<_>>();
@@ -294,7 +394,7 @@ pub fn create_plan(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    let selected = select_files(shared_files, &requested, season);
+    let selected = select_files(shared_files, &requested, season, metadata_episodes);
     let mut save_batch = Vec::new();
     let mut estimated_bytes = 0_u64;
     for file in &selected {

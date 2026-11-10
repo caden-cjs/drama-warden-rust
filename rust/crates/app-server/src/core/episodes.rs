@@ -257,10 +257,15 @@ pub async fn list_storage_episodes(
     let scanned_expr = if mysql {
         "CAST(es.scanned_at AS CHAR)"
     } else {
-        "CAST(es.scanned_at AS BLOB)"
+        "CAST(es.scanned_at AS TEXT)"
+    };
+    let status_expr = if mysql {
+        "CAST(es.status AS BINARY)"
+    } else {
+        "CAST(es.status AS TEXT)"
     };
     let query = format!(
-        "SELECT s.season_number, e.episode_number, CAST(es.status AS BINARY) AS status, es.asset_count, {scanned_expr} AS scanned_at FROM show_episode_storage es JOIN show_episode e ON e.id = es.episode_id JOIN show_season s ON s.id = e.season_id WHERE es.show_storage_id = ? ORDER BY s.season_number, e.episode_number"
+        "SELECT s.season_number, e.episode_number, {status_expr} AS status, es.asset_count, {scanned_expr} AS scanned_at FROM show_episode_storage es JOIN show_episode e ON e.id = es.episode_id JOIN show_season s ON s.id = e.season_id WHERE es.show_storage_id = ? ORDER BY s.season_number, e.episode_number"
     );
     let rows = sqlx::query(&query)
         .bind(storage_id)
@@ -280,6 +285,29 @@ pub async fn list_storage_episodes(
                 asset_count: row.try_get("asset_count").map_err(EpisodeError::Database)?,
                 scanned_at: optional_text(row, "scanned_at")?,
             })
+        })
+        .collect()
+}
+
+pub async fn list_episode_metadata(
+    pool: &AnyPool,
+    show_id: i64,
+    season_number: i64,
+) -> Result<Vec<Value>, EpisodeError> {
+    let rows = sqlx::query(
+        "SELECT e.episode_number, sem.name FROM show_episode e JOIN show_season s ON s.id = e.season_id JOIN show_episode_metadata sem ON sem.episode_id = e.id WHERE s.show_id = ? AND s.season_number = ? ORDER BY e.episode_number",
+    )
+    .bind(show_id)
+    .bind(season_number)
+    .fetch_all(pool)
+    .await
+    .map_err(EpisodeError::Database)?;
+    rows.iter()
+        .map(|row| {
+            Ok(serde_json::json!({
+                "episodeNumber": row.try_get::<i64, _>("episode_number").map_err(EpisodeError::Database)?,
+                "name": optional_text(row, "name")?,
+            }))
         })
         .collect()
 }

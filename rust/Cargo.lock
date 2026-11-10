@@ -425,11 +425,13 @@ dependencies = [
 
 [[package]]
 name = "drama-warden-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum",
  "drama-warden-plugin-protocol",
+ "hex",
  "reqwest",
+ "ring",
  "serde",
  "serde-saphyr",
  "serde_json",

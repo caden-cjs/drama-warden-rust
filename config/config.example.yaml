@@ -23,11 +23,11 @@ storage:
     root: ./data/media
     shareRoot: ./data/shares
   quark:
-    stateDirectory: ./data/.quarkclouddrive
-    recycleDirectory: /DramaWarden-Recycle/Quark
+    # Optional: requires INCLUDE_QUARK_CLI=true when building the Docker image.
+    # Configure CLI path, authorization state directory, and recycle directory from /plugins.
   pan115:
-    minIntervalMs: 3000
-    wafCooldownMs: 300000
+    # Optional: requires INCLUDE_115_CLI=true when building the Docker image.
+    # Configure CLI path, Cookie, and rate limits from /plugins.
 
 indexer:
   smartstrm:

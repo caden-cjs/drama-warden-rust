@@ -32,7 +32,7 @@ Plugin management routes use the same Bearer token as every other protected rout
 
 `GET /api/plugin-calls` lists recent provider capability calls. Optional filters are `pluginId`, `capability`, `source`, `correlationId`, and `ok=true|false`; `limit` defaults to 50 and is capped at 100, while `offset` defaults to 0. The response contains `id`, `pluginId`, `capability`, `source`, `correlationId`, `ok`, `errorCode`, `durationMs`, and `calledAt`. The database prunes to the newest 10,000 records at startup and after each 100 calls. Input, output, credentials, and raw error messages are not recorded. If an operation succeeds but its audit write fails, the plugin host returns `PLUGIN_AUDIT_FAILED` and marks that the side effect may have completed; inspect the operation's target state before retrying a write.
 
-Plugin credentials and provider configuration remain deployment environment settings. Plugin management stores only enabled state and order, and the API does not return credentials or accept plugin secret values.
+Plugin configuration is schema-driven. `GET /api/plugins/:id/config` returns configured state and safe non-secret values; password fields are never returned. `POST .../config/validate` checks a patch without saving. `PATCH .../config` saves a partial update and requires `{ "config": {}, "expectedRevision": 1 }`; `DELETE .../config` clears database overrides and takes `{ "expectedRevision": 1 }`. Secret writes require a deployment-provided 32-byte hex `PLUGIN_CONFIG_ENCRYPTION_KEY`. See [plugin configuration design](PLUGIN-CONFIGURATION-API.md) for key handling, compatibility sources, and scope rules.
 
 ## Routes
 
@@ -40,6 +40,10 @@ Plugin credentials and provider configuration remain deployment environment sett
 | --- | --- | --- |
 | `GET` | `/api/health` | Public database health check |
 | `GET` | `/api/plugins` | List registered plugins and their public contracts |
+| `GET` | `/api/plugins/:id/config` | Read configuration schema, safe values, sources, and revision |
+| `POST` | `/api/plugins/:id/config/validate` | Validate a config patch without persisting it |
+| `PATCH` | `/api/plugins/:id/config` | Save and apply a config patch |
+| `DELETE` | `/api/plugins/:id/config` | Clear database overrides and restore deployment/default values |
 | `GET` | `/api/plugin-calls` | List recent metadata-only plugin capability audit records |
 | `PUT` | `/api/plugins/:id` | Enable or disable a registered plugin |
 | `POST` | `/api/plugins/:id/move` | Move a plugin up or down within its kind |
