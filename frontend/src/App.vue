@@ -104,7 +104,7 @@ async function refreshConnection() {
   databaseState.value = 'checking';
   try {
     const health = await api.request('/api/health');
-    databaseState.value = health.database === 'ok' ? 'ok' : 'error';
+    databaseState.value = health.ok === true && health.database !== 'unavailable' ? 'ok' : 'error';
   } catch {
     databaseState.value = 'error';
   }
@@ -177,7 +177,7 @@ onMounted(refreshConnection);
             <small>数据库 {{ databaseState === 'ok' ? '正常' : databaseState === 'checking' ? '检查中' : '不可用' }}</small>
           </div>
         </div>
-        <div class="sidebar-version">开源版 · 0.1.0</div>
+        <div class="sidebar-version">开源版 · 0.1.1</div>
       </div>
     </aside>
 

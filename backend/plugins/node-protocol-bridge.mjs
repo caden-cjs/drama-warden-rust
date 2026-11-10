@@ -21,23 +21,23 @@ const definitions = {
     name: 'Local filesystem', label: '本地文件系统', kind: 'storage-provider', version: '0.1.0',
     module: './local-storage/index.mjs', factory: 'createLocalStoragePlugin',
     fields: [
-      { key: 'storageRoot', type: 'text', required: true },
-      { key: 'shareRoot', type: 'text', required: true },
+      { key: 'storageRoot', type: 'path', label: '媒体目录', description: '服务端可访问的本地媒体根目录。', required: true, scope: 'deployment' },
+      { key: 'shareRoot', type: 'path', label: '分享目录', required: true, scope: 'deployment' },
     ],
   },
   'local-resource': {
     name: 'Local share search', label: '本地分享搜索', kind: 'resource-provider', version: '0.1.0',
     module: './local-resource/index.mjs', factory: 'createLocalResourcePlugin',
-    fields: [{ key: 'shareRoot', type: 'text', required: true }],
+    fields: [{ key: 'shareRoot', type: 'path', label: '分享目录', required: true, scope: 'deployment' }],
   },
   quark: {
     name: 'Quark Cloud Drive', label: '夸克网盘', kind: 'storage-provider', version: '0.1.0',
     module: './quark/index.mjs', factory: 'createQuarkStoragePlugin',
     fields: [
-      { key: 'cliPath', type: 'text', required: true },
-      { key: 'homeDirectory', type: 'text', required: false },
-      { key: 'stateDirectory', type: 'text', required: false },
-      { key: 'recycleDirectory', type: 'text', required: false },
+      { key: 'cliPath', type: 'path', label: '夸克 CLI 路径', description: '指向已安装的官方夸克 CLI。', required: true },
+      { key: 'homeDirectory', type: 'path', label: '用户目录' },
+      { key: 'stateDirectory', type: 'path', label: '授权状态目录' },
+      { key: 'recycleDirectory', type: 'path', label: '项目回收目录' },
     ],
     removeModes: ['recycle'],
   },
@@ -45,11 +45,11 @@ const definitions = {
     name: '115 Cloud Drive', label: '115 网盘', kind: 'storage-provider', version: '0.1.0',
     module: './pan115/index.mjs', factory: 'createPan115StoragePlugin',
     fields: [
-      { key: 'cliPath', type: 'text', required: false },
-      { key: 'homeDirectory', type: 'text', required: false },
-      { key: 'cookie', type: 'password', required: false },
-      { key: 'minIntervalMs', type: 'text', required: false },
-      { key: 'wafCooldownMs', type: 'text', required: false },
+      { key: 'cliPath', type: 'path', label: '115 CLI 路径', description: '指向已安装的 115cli。', required: true },
+      { key: 'homeDirectory', type: 'path', label: '用户目录' },
+      { key: 'cookie', type: 'password', label: '登录 Cookie', description: '授权状态保存成功后可清除。' },
+      { key: 'minIntervalMs', type: 'integer', label: '最小调用间隔（毫秒）', min: 0, max: 60000 },
+      { key: 'wafCooldownMs', type: 'integer', label: 'WAF 冷却时间（毫秒）', min: 0, max: 3600000 },
     ],
     removeModes: ['permanent'],
   },
@@ -120,7 +120,7 @@ function manifestFor(id, definition) {
     subscriptions: definition.subscriptions || [],
     configSchema: {
       version: 1,
-      fields: definition.fields.map(({ key, type, required }) => ({ key, type, required })),
+      fields: definition.fields,
     },
   };
   if (definition.kind === 'storage-provider') {
@@ -199,8 +199,25 @@ async function createPlugin(id, definition, config) {
   return plugin;
 }
 
-function normalizedError(error) {
-  const code = String(error?.code || 'PLUGIN_ERROR');
+function normalizedError(error, pluginId, input) {
+  const originalCode = String(error?.code || '');
+  const message = String(error?.message || '').toLowerCase();
+  const capability = String(input?.capability || 'invoke').toUpperCase().replace(/[^A-Z0-9_]/g, '_');
+  const prefix = String(pluginId || 'PLUGIN').toUpperCase().replace(/[^A-Z0-9_]/g, '_');
+  let code = originalCode;
+  if (code === 'ENOENT') code = `${prefix}_CLI_UNAVAILABLE`;
+  else if (code === 'EACCES' || code === 'EPERM') code = `${prefix}_CLI_PERMISSION_DENIED`;
+  else if (!/^[A-Z0-9_]{1,64}$/.test(code) || code === 'PLUGIN_ERROR') {
+    if (/timed? ?out|timeout|time limit/.test(message)) code = 'PLUGIN_TIMEOUT';
+    else if (/not configured|not installed|(?:cli|command).*(?:unavailable|not installed|not configured)|command not found|spawn.*enoent/.test(message)) code = `${prefix}_CLI_UNAVAILABLE`;
+    else if (/unauthoriz|not_authenticated|cookie|token.*expir|认证|未授权|登录|授权/.test(message)) code = `${prefix}_AUTH_FAILED`;
+    else if (capability === 'LISTSHAREDFILES' && /passcode|password|提取码|密码/.test(message)) code = `${prefix}_SHARE_PASSCODE_INVALID`;
+    else if (capability === 'LISTSHAREDFILES' && /rate.?limit|too many requests|频繁|请求过多/.test(message)) code = `${prefix}_SHARE_RATE_LIMITED`;
+    else if (capability === 'LISTSHAREDFILES' && /share|分享|链接/.test(message) && /not found|expired|invalid|unavailable|deleted|不存在|失效|过期|已取消/.test(message)) code = `${prefix}_SHARE_UNAVAILABLE`;
+    else if (/file.?not.?found|directory not found|path.*not found|no such (file|directory)|does not exist|文件不存在|目录不存在|路径不存在/.test(message)) code = 'STORAGE_PATH_NOT_FOUND';
+    else if (/absolute safe path|storage path must be absolute|unsafe path/.test(message)) code = 'INVALID_STORAGE_PATH';
+    else code = `${prefix}_${capability}_FAILED`;
+  }
   return {
     code: /^[A-Z0-9_]{1,64}$/.test(code) ? code : 'PLUGIN_ERROR',
     sideEffectMayHaveCompleted: Boolean(error?.sideEffectMayHaveCompleted),
@@ -250,7 +267,7 @@ else {
     } catch (error) {
       process.stdout.write(JSON.stringify({
         requestId: request?.requestId || '',
-        error: normalizedError(error),
+        error: normalizedError(error, id, request?.input),
       }) + '\n');
     }
   }

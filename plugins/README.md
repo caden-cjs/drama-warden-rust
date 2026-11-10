@@ -32,3 +32,5 @@ plugins:
 ```
 
 Each adapter declares only its own capabilities. Configure values through the existing provider environment fields (`CLOUDSAVER_URL`, `LOCAL_STORAGE_ROOT`, `QUARK_CLI_PATH`, `PAN115_COOKIE`, `SMARTSTRM_BASE_URL`, and so on); the Rust host passes only fields declared by each manifest to its child process. These bridge adapters preserve the provider integration behind the process boundary while the Rust service owns HTTP requests, database state, scheduling, and workflow decisions.
+
+The bundled Quark and 115 adapters are Node.js plugins today; they invoke the official Quark CLI and the Python `115cli`, respectively. They are not native Rust implementations. Build flags, executable paths, authorization setup, persistent state volumes, and each provider's removal behavior are documented in [Built-in cloud storage providers](../docs/PROVIDERS.md#built-in-cloud-storage-providers).

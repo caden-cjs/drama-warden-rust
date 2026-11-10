@@ -1,6 +1,6 @@
 {
   "name": "drama-warden",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "追剧引擎：家庭媒体库追更与归档自动化",
   "private": true,
   "type": "module",

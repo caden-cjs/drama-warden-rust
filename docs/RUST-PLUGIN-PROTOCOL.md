@@ -18,6 +18,8 @@ The host bounds every request with the descriptor's `timeoutMs` (100 ms through 
 
 Set `plugins.commands` in `config/config.yaml` or `DRAMA_WARDEN_PLUGIN_COMMANDS` in the process environment to a list containing only executable paths, argument arrays, and optional timeouts. A non-empty environment value overrides YAML. Configuration schemas are declared by each child process manifest. For example:
 
+The current host resolves configuration from manifest-declared environment variables and sends the effective fields during `initialize`; it does not persist provider configuration or expose secret values in the API. A proposed schema-driven API for future plugin configuration is documented in [Plugin management and configuration API design](PLUGIN-CONFIGURATION-API.md).
+
 ```yaml
 plugins:
   commands:

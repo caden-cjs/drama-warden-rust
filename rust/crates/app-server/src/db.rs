@@ -3,20 +3,22 @@ use std::{env, path::Path, time::Duration};
 use sqlx::{AnyPool, any::AnyPoolOptions, raw_sql};
 use url::Url;
 
-const CURRENT_SCHEMA_VERSION: i64 = 5;
-const SQLITE_MIGRATIONS: [&str; 5] = [
+const CURRENT_SCHEMA_VERSION: i64 = 6;
+const SQLITE_MIGRATIONS: [&str; 6] = [
     include_str!("../../../migrations/sqlite/0001_core.sql"),
     include_str!("../../../migrations/sqlite/0002_subtitle_jobs.sql"),
     include_str!("../../../migrations/sqlite/0003_application_settings.sql"),
     include_str!("../../../migrations/sqlite/0004_plugin_call_log.sql"),
     include_str!("../../../migrations/sqlite/0005_show_category.sql"),
+    include_str!("../../../migrations/sqlite/0006_plugin_configuration.sql"),
 ];
-const MYSQL_MIGRATIONS: [&str; 5] = [
+const MYSQL_MIGRATIONS: [&str; 6] = [
     include_str!("../../../migrations/mysql/0001_core.sql"),
     include_str!("../../../migrations/mysql/0002_subtitle_jobs.sql"),
     include_str!("../../../migrations/mysql/0003_application_settings.sql"),
     include_str!("../../../migrations/mysql/0004_plugin_call_log.sql"),
     include_str!("../../../migrations/mysql/0005_show_category.sql"),
+    include_str!("../../../migrations/mysql/0006_plugin_configuration.sql"),
 ];
 
 #[derive(Clone)]
