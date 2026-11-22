@@ -242,16 +242,16 @@ export async function pan115List(targetPath = "/", { limit = 20, recent = false 
 }
 
 function parseHumanSize(value) {
-  if (typeof value === "number" && Number.isFinite(value)) return value
+  if (typeof value === "number" && Number.isFinite(value)) return Math.round(value)
   const text = String(value ?? "").trim().replaceAll(",", "")
   if (!text || text === "-") return 0
   const numeric = Number(text)
-  if (Number.isFinite(numeric)) return numeric
+  if (Number.isFinite(numeric)) return Math.round(numeric)
   const match = text.match(/^([\d.]+)\s*(B|bytes?|KB|MB|GB|TB|PB|KiB|MiB|GiB|TiB|PiB)$/i)
   if (!match) return 0
   const unit = match[2].toLowerCase()
   const power = unit === "b" || unit.startsWith("byte") ? 0 : ({ kb: 1, kib: 1, mb: 2, mib: 2, gb: 3, gib: 3, tb: 4, tib: 4, pb: 5, pib: 5 })[unit]
-  return Number(match[1]) * 1024 ** power
+  return Math.round(Number(match[1]) * 1024 ** power)
 }
 
 function parseShareMtime(value) {

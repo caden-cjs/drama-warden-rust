@@ -4,6 +4,39 @@ function codedError(code) {
   return Object.assign(new Error(code), { code });
 }
 
+function normalizedTitle(value) {
+  return String(value || '')
+    .normalize('NFKC')
+    .toLocaleLowerCase()
+    .replace(/[\s\p{P}\p{S}]+/gu, '');
+}
+
+function comparableResourceTitle(value) {
+  return String(value || '')
+    .normalize('NFKC')
+    .replace(/^\s*名称\s*[:：]\s*/u, '')
+    .replace(/^\s*(?:🎬|📺)\s*/u, '')
+    .replace(/^(?:电视剧|连续剧|电影|动漫|综艺)\s*[|｜:：]\s*/u, '')
+    .trim();
+}
+
+function resourceRelevance(item, query, mediaType) {
+  const rawTitle = String(item?.title || '');
+  const title = normalizedTitle(rawTitle);
+  const comparable = normalizedTitle(comparableResourceTitle(rawTitle));
+  const normalizedQuery = normalizedTitle(query);
+  let score = title.includes(normalizedQuery) ? 500 : 0;
+  if (comparable === normalizedQuery) score = Math.max(score, 950);
+  else if (comparable.startsWith(normalizedQuery)) score = Math.max(score, 800);
+  else if (title.startsWith(normalizedQuery)) score = Math.max(score, 700);
+
+  if (mediaType === 'tv') {
+    if (/电视剧|连续剧|剧集|\bseries\b|\btv\b/i.test(rawTitle)) score += 500;
+    if (/电影|\bmovie\b|\bfilm\b/i.test(rawTitle)) score -= 500;
+  }
+  return score;
+}
+
 export function createCloudSaverResourcePlugin({
   cloudsaverUrl = process.env.CLOUDSAVER_URL,
   cloudsaverUser = process.env.CLOUDSAVER_USER,
@@ -45,7 +78,7 @@ export function createCloudSaverResourcePlugin({
     return token && expiresAt - now > 60 ? token : login();
   }
 
-  async function search({ query, keyword, storageProvider = '', limit = 100 } = {}) {
+  async function search({ query, keyword, aliases = [], mediaType = '', storageProvider = '', limit = 100 } = {}) {
     const searchTerm = String(query || keyword || '').trim();
     if (!searchTerm) throw codedError('RESOURCE_QUERY_REQUIRED');
     const authorization = await getToken();
@@ -60,6 +93,7 @@ export function createCloudSaverResourcePlugin({
     if (result?.success !== true) throw codedError('CLOUDSAVER_SEARCH_FAILED');
     const channels = Array.isArray(result?.data) ? result.data : [];
     const items = [];
+    const seenUrls = new Set();
     const requestedProvider = String(storageProvider || '').trim().toLowerCase();
     const targetProvider = requestedProvider === '115' ? 'pan115' : requestedProvider;
     for (const channel of channels) {
@@ -69,7 +103,8 @@ export function createCloudSaverResourcePlugin({
           const urlValue = String(link?.link || '').trim();
           const rawProviderId = String(link?.cloudType || '').trim().toLowerCase();
           const providerId = rawProviderId === '115' ? 'pan115' : rawProviderId;
-          if (!urlValue || (targetProvider && targetProvider !== providerId)) continue;
+          if (!urlValue || seenUrls.has(urlValue) || (targetProvider && targetProvider !== providerId)) continue;
+          seenUrls.add(urlValue);
           items.push({
             shareUrl: urlValue,
             title: String(entry?.title || ''),
@@ -77,13 +112,24 @@ export function createCloudSaverResourcePlugin({
             sourceName: String(source.name || channel?.channel || ''),
             storageProvider: providerId,
           });
-          if (items.length >= Math.max(1, Math.min(Number(limit) || 100, 500))) {
-            return { items, truncated: true };
-          }
         }
       }
     }
-    return { items, truncated: false };
+    const maxResults = Math.max(1, Math.min(Number(limit) || 100, 500));
+    const stableQueries = [searchTerm, ...(Array.isArray(aliases) ? aliases : [])]
+      .map(value => String(value || '').trim())
+      .filter(Boolean);
+    const ranked = items
+      .map((item, index) => ({
+        item,
+        index,
+        score: Math.max(...stableQueries.map(value => resourceRelevance(item, value, mediaType))),
+      }))
+      .sort((left, right) => right.score - left.score || left.index - right.index);
+    return {
+      items: ranked.slice(0, maxResults).map(entry => entry.item),
+      truncated: ranked.length > maxResults,
+    };
   }
 
   return {
