@@ -1319,6 +1319,7 @@ async fn run_automation_scan(
                         continue;
                     }
                 };
+                let mut storage_selected_for_automation = false;
                 for storage in storages {
                     if storages_checked >= 200 {
                         storage_limit_reached = true;
@@ -1394,11 +1395,16 @@ async fn run_automation_scan(
                             )
                             .await;
                             let (status, result) = response_json(queue_response).await;
-                            if status.is_success()
-                                && result.get("queued").and_then(serde_json::Value::as_bool)
+                            if status.is_success() {
+                                if result.get("queued").and_then(serde_json::Value::as_bool)
                                     == Some(true)
-                            {
-                                events_queued += 1;
+                                {
+                                    events_queued += 1;
+                                }
+                                // One enabled storage with an eligible candidate is enough for
+                                // this show. Trying the next provider would copy the same
+                                // episodes into a second cloud drive.
+                                storage_selected_for_automation = true;
                             } else if !status.is_success() && errors.len() < 100 {
                                 let error_code = result
                                     .get("code")
@@ -1410,6 +1416,9 @@ async fn run_automation_scan(
                                 }));
                             }
                         }
+                    }
+                    if storage_selected_for_automation {
+                        break;
                     }
                 }
                 if storage_limit_reached {
