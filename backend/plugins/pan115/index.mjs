@@ -89,7 +89,16 @@ export function createPan115StoragePlugin({
 
   async function listDirectory(targetPath) {
     await ensureCookieImported();
-    return normalizeDirectoryListing(await adapter.pan115List(targetPath, { limit: 500 }));
+    try {
+      return normalizeDirectoryListing(await adapter.pan115List(targetPath, { limit: 500 }));
+    } catch (error) {
+      if (error?.code === 'STORAGE_PATH_NOT_FOUND'
+          || /(?:directory|path|file).{0,80}(?:not\s*found|does not exist|doesn't exist)|no such (?:file|directory)|目录不存在|路径不存在/i
+            .test(String(error?.message || error))) {
+        return { files: [], truncated: false, recent: false };
+      }
+      throw error;
+    }
   }
 
   async function listSharedFiles({ shareUrl, options = {} } = {}) {
@@ -244,21 +253,51 @@ export function createPan115StoragePlugin({
       initializationError = false;
     },
     async health() {
+      let available = false;
       try {
-        if (!(await adapter.isAvailable())) {
-          return { ok: false, configured: false, detail: '115cli 未安装' };
-        }
+        available = typeof adapter.isAvailable === 'function' && await adapter.isAvailable();
+      } catch {
+        available = false;
+      }
+      if (!available) {
+        return {
+          ok: false,
+          configured: false,
+          authorized: false,
+          errorCode: 'PAN115_CLI_UNAVAILABLE',
+          detail: '115cli 未安装或不可执行',
+        };
+      }
+
+      try {
         await ensureCookieImported();
+      } catch {
+        return {
+          ok: false,
+          configured: true,
+          authorized: false,
+          errorCode: 'PAN115_AUTH_FAILED',
+          detail: initializationError ? '115 Cookie 导入或账号验证失败' : '115 授权失败',
+        };
+      }
+
+      try {
         const status = statusShape(await adapter.pan115Status());
         return {
           ok: status.ok,
-          configured: status.configured,
-          detail: status.ok
-            ? '115 授权有效'
-            : initializationError ? '115 Cookie 导入或账号验证失败' : '115 尚未授权',
+          configured: true,
+          authorized: status.ok,
+          ...(!status.ok ? { errorCode: 'PAN115_AUTH_FAILED' } : {}),
+          detail: status.ok ? '115 授权有效' : '115 尚未授权或授权已失效',
         };
       } catch {
-        return { ok: false, configured: false, detail: '115cli 不可用' };
+        return {
+          ok: false,
+          configured: true,
+          authorized: false,
+          errorCode: 'PAN115_STATUS_FAILED',
+          detail: '115 账号状态检查失败',
+        };
       }
     },
   });

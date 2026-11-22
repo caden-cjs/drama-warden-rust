@@ -70,7 +70,15 @@ function statusShape(status) {
 
 export function createQuarkStoragePlugin(cli = api) {
   async function listDirectory(targetPath) {
-    return normalizeDirectoryListing(await cli.quarkList(targetPath, { limit: 0 }));
+    try {
+      return normalizeDirectoryListing(await cli.quarkList(targetPath, { limit: 0 }));
+    } catch (error) {
+      if (error?.code === 'STORAGE_PATH_NOT_FOUND'
+          || /^Quark directory not found:/i.test(String(error?.message || error))) {
+        return { files: [], truncated: false, recent: false };
+      }
+      throw error;
+    }
   }
 
   async function listSharedFiles({ shareUrl, options = {} } = {}) {

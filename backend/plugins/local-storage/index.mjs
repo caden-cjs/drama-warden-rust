@@ -185,8 +185,17 @@ export function createLocalStoragePlugin({
   }
 
   async function storageListing(input = {}) {
-    const { target, segments } = await resolveStoragePath(input.path, { allowRoot: true });
-    const rootStat = await lstat(target);
+    const { target, segments } = await resolveStoragePath(input.path, {
+      allowRoot: true,
+      allowMissing: true,
+    });
+    let rootStat;
+    try {
+      rootStat = await lstat(target);
+    } catch (error) {
+      if (error?.code === 'ENOENT') return { files: [], total: 0, truncated: false };
+      throw error;
+    }
     if (!rootStat.isDirectory()) {
       throw pluginError('storage listing path must be a directory', 'NOT_A_DIRECTORY');
     }

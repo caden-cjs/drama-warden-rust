@@ -238,8 +238,19 @@ async function handle(id, method, input) {
     await initializedPlugin.reset?.();
     return { ok: true };
   }
-  if (method === 'health') return (await initializedPlugin.health?.()) || { ok: true };
-  if (method === 'monitor') return (await initializedPlugin.monitor?.(input || {})) || { ok: true };
+  if (method === 'health' || method === 'monitor') {
+    const preferred = method === 'monitor' ? initializedPlugin.monitor : initializedPlugin.health;
+    const fallback = method === 'monitor' ? initializedPlugin.health : initializedPlugin.monitor;
+    const check = typeof preferred === 'function' ? preferred : fallback;
+    if (typeof check !== 'function') {
+      return { ok: false, configured: false, errorCode: 'PLUGIN_HEALTH_CHECK_UNAVAILABLE' };
+    }
+    const result = await check.call(initializedPlugin, input || {});
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+      return { ok: false, configured: false, errorCode: 'PLUGIN_HEALTH_CHECK_INVALID' };
+    }
+    return result;
+  }
   if (method === 'invoke') {
     return initializedPlugin.invoke({
       capability: input?.capability,

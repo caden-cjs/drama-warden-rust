@@ -232,6 +232,11 @@ export async function pan115List(targetPath = "/", { limit = 20, recent = false 
       recent,
     };
   } catch (e) {
+    if (/(?:directory|path|file).{0,80}(?:not\s*found|does not exist|doesn't exist)|no such (?:file|directory)|目录不存在|路径不存在/i.test(String(e?.message || e))) {
+      const missing = new Error(`115 storage directory not found: ${targetPath}`);
+      missing.code = 'STORAGE_PATH_NOT_FOUND';
+      throw missing;
+    }
     throw new Error("pan115List failed: " + e.message);
   }
 }
@@ -411,9 +416,7 @@ export async function mkdirParents(p) {
   const fullPath = parts.join("/");
   try { await run115cli(["mkdir", "-p", fullPath]); }
   catch (e) {
-    if (!/exists|already|EXISTS/i.test(String(e.message))) {
-      console.warn("[115 mkdir -p]", fullPath, e.message);
-    }
+    if (!/exists|already/i.test(String(e.message))) throw e;
   }
   // 115 后端落地延迟
   await new Promise(r => setTimeout(r, 500));
