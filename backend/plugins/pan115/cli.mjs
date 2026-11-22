@@ -175,8 +175,8 @@ function parseLsText(text) {
     const cleanName = name.replace(/\/$/, "");
     const isDir = taggedAsDir && !looksLikeFile(cleanName);
 
-    // size:"-" 或空 → 0
-    const size = sizeStr && sizeStr !== "-" ? Number(sizeStr) || 0 : 0;
+    // 115cli may print bytes as a number or use a human-readable unit.
+    const size = sizeStr && sizeStr !== "-" ? parseHumanSize(sizeStr) : 0;
 
     // mtime 解析:由容器 TZ 决定语义,这里不预设 UTC+8
     // 上层 cloud-mtime.mjs 收到的就是秒级时间戳
