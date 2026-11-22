@@ -1,7 +1,6 @@
 import { createHash } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
 import {
-  access,
   copyFile,
   lstat,
   mkdir,
@@ -589,8 +588,9 @@ export function createLocalStoragePlugin({
     async health() {
       try {
         requireReady();
-        await access(storageRootPath);
-        await access(shareRootPath);
+        // A configured media path can be temporarily absent (for example, a
+        // mount is not present yet). Listing that path already treats ENOENT
+        // as an empty directory, so the plugin itself should stay available.
         return { ok: true, configured: true };
       } catch (error) {
         return { ok: false, configured: false, errorCode: error?.code || 'LOCAL_STORAGE_ERROR' };
