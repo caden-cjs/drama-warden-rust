@@ -704,7 +704,13 @@ pub async fn recover_event(
             "confirm_no_active_worker_required",
         ));
     }
-    if !["complete", "retry_after_review"].contains(&input.action.as_str()) {
+    if ![
+        "complete",
+        "retry_after_review",
+        "discard_after_review",
+    ]
+    .contains(&input.action.as_str())
+    {
         return Err(events::EventError::Invalid("invalid_recovery_action"));
     }
     if input.action == "complete" && input.confirm_outputs_match != Some(true) {
@@ -712,7 +718,7 @@ pub async fn recover_event(
             "confirm_outputs_match_required",
         ));
     }
-    if input.action == "retry_after_review" && input.confirm_no_output != Some(true) {
+    if input.action != "complete" && input.confirm_no_output != Some(true) {
         return Err(events::EventError::Invalid("confirm_no_output_required"));
     }
 
@@ -842,7 +848,7 @@ pub async fn recover_event(
         .map_err(recovery_error)?;
         expected.push((file.clone(), name.to_owned(), canonical, file_size, episode));
     }
-    if input.action == "retry_after_review" {
+    if matches!(input.action.as_str(), "retry_after_review" | "discard_after_review") {
         let possible: HashSet<String> = expected
             .iter()
             .flat_map(|(_, name, canonical, _, _)| [name.clone(), canonical.clone()])
@@ -852,6 +858,18 @@ pub async fn recover_event(
                 && basename(file).is_some_and(|name| possible.contains(&name))
         }) {
             return Err(recovery_error("recovery_output_present"));
+        }
+        if input.action == "discard_after_review" {
+            let event = events::discard_followup_no_output(
+                pool,
+                event_id,
+                storage_id,
+                season_number,
+                &episode_numbers,
+                mysql,
+            )
+            .await?;
+            return Ok(json!({"ok":true,"event":event,"resolution":"discarded"}));
         }
         let event = events::recover_followup_no_output(
             pool,

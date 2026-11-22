@@ -186,7 +186,7 @@ async function recoverInterrupted(action) {
   if (!event) return;
   if (!recoveryWorkerConfirmed.value) return;
   if (action === 'complete' && !recoveryOutputConfirmed.value) return;
-  if (action === 'retry_after_review' && !recoveryNoOutputConfirmed.value) return;
+  if (action !== 'complete' && !recoveryNoOutputConfirmed.value) return;
   recoveringId.value = event.id;
   try {
     const result = await api.request(`/api/events/${event.id}/recover`, {
@@ -195,12 +195,14 @@ async function recoverInterrupted(action) {
         action,
         confirmNoActiveWorker: true,
         ...(action === 'complete' ? { confirmOutputsMatch: true } : {}),
-        ...(action === 'retry_after_review' ? { confirmNoOutput: true } : {}),
+        ...(action !== 'complete' ? { confirmNoOutput: true } : {}),
       },
     });
     notify(result.resolution === 'processed'
       ? '已核对媒体并完成事件。'
-      : '已确认目标目录没有本次媒体；事件可安全重试。');
+      : result.resolution === 'discarded'
+        ? '已确认没有本次媒体；旧事件已放弃，可以重新选择分享。'
+        : '已确认目标目录没有本次媒体；事件可安全重试。');
     recoveryEvent.value = null;
     recoveryWorkerConfirmed.value = false;
     recoveryOutputConfirmed.value = false;
@@ -280,7 +282,33 @@ onBeforeUnmount(() => loadObserver?.disconnect());
           </div>
         </section>
       </div>
-      <div v-if="recoveryEvent" class="modal-backdrop" @click.self="closeRecovery"><section class="modal confirm-modal recovery-modal" role="dialog" aria-modal="true" aria-labelledby="recovery-title"><div class="confirm-icon">↻</div><span class="modal-kicker">#{{ recoveryEvent.id }} · {{ recoveryEvent.status === 'processing' ? '中断复核' : '写入复核' }}</span><h2 id="recovery-title">核对这次转存停在了哪一步</h2><p>服务不会再次保存分享文件。它会重新读取 Season {{ String(recoveryEvent.payload?.seasonNumber || '').padStart(2, '0') }}：文件名和大小只能筛选候选，不能证明文件来自本次转存。完成操作会继续整理目录、同步资产和刷新索引；确认无输出后才会开放人工重试。</p><div class="confirm-event-summary"><strong>{{ eventTitle(recoveryEvent) }}</strong><small>{{ showName(recoveryEvent) }} · {{ recoveryEvent.payload?.selectedFiles?.length ?? '所选媒体文件' }} 个文件</small></div><div class="recovery-confirm"><n-checkbox v-model:checked="recoveryWorkerConfirmed">我已确认没有其他应用实例正在处理这条事件。</n-checkbox></div><div class="recovery-confirm"><n-checkbox v-model:checked="recoveryOutputConfirmed">若选择完成，我确认目标目录中的所选文件确实属于本次事件。</n-checkbox></div><div class="recovery-confirm"><n-checkbox v-model:checked="recoveryNoOutputConfirmed">若选择重试，我已检查目标目录，确认其中没有本次所选媒体。</n-checkbox></div><div class="modal-actions"><n-button class="button button-quiet" attr-type="button" :disabled="recoveringId === recoveryEvent.id" @click="closeRecovery">返回</n-button><n-button class="button button-secondary" attr-type="button" :disabled="recoveringId === recoveryEvent.id || !recoveryWorkerConfirmed || !recoveryOutputConfirmed" @click="recoverInterrupted('complete')">{{ recoveringId === recoveryEvent.id ? '正在核对…' : '核对并完成' }}</n-button><n-button class="button button-danger" attr-type="button" :disabled="recoveringId === recoveryEvent.id || !recoveryWorkerConfirmed || !recoveryNoOutputConfirmed" @click="recoverInterrupted('retry_after_review')">确认无媒体并允许重试</n-button></div></section></div>
+      <div v-if="recoveryEvent" class="modal-backdrop" @click.self="closeRecovery">
+        <section class="modal confirm-modal recovery-modal" role="dialog" aria-modal="true" aria-labelledby="recovery-title">
+          <div class="confirm-icon">↻</div>
+          <span class="modal-kicker">#{{ recoveryEvent.id }} · {{ recoveryEvent.status === 'processing' ? '中断复核' : '写入复核' }}</span>
+          <h2 id="recovery-title">核对这次转存停在了哪一步</h2>
+          <p>服务不会再次保存分享文件。它会重新读取 Season {{ String(recoveryEvent.payload?.seasonNumber || '').padStart(2, '0') }}：文件名和大小只能筛选候选，不能证明文件来自本次转存。完成操作会继续整理目录、同步资产和刷新索引；确认无输出后才会开放人工重试或放弃旧事件。</p>
+          <div class="confirm-event-summary">
+            <strong>{{ eventTitle(recoveryEvent) }}</strong>
+            <small>{{ showName(recoveryEvent) }} · {{ recoveryEvent.payload?.selectedFiles?.length ?? '所选媒体文件' }} 个文件</small>
+          </div>
+          <div class="recovery-confirm">
+            <n-checkbox v-model:checked="recoveryWorkerConfirmed">我已确认没有其他应用实例正在处理这条事件。</n-checkbox>
+          </div>
+          <div class="recovery-confirm">
+            <n-checkbox v-model:checked="recoveryOutputConfirmed">若选择完成，我确认目标目录中的所选文件确实属于本次事件。</n-checkbox>
+          </div>
+          <div class="recovery-confirm">
+            <n-checkbox v-model:checked="recoveryNoOutputConfirmed">若选择重试或放弃，我已检查目标目录，确认其中没有本次所选媒体。</n-checkbox>
+          </div>
+          <div class="modal-actions">
+            <n-button class="button button-quiet" attr-type="button" :disabled="recoveringId === recoveryEvent.id" @click="closeRecovery">返回</n-button>
+            <n-button class="button button-secondary" attr-type="button" :disabled="recoveringId === recoveryEvent.id || !recoveryWorkerConfirmed || !recoveryOutputConfirmed" @click="recoverInterrupted('complete')">{{ recoveringId === recoveryEvent.id ? '正在核对…' : '核对并完成' }}</n-button>
+            <n-button class="button button-danger" attr-type="button" :disabled="recoveringId === recoveryEvent.id || !recoveryWorkerConfirmed || !recoveryNoOutputConfirmed" @click="recoverInterrupted('retry_after_review')">确认无媒体并允许重试</n-button>
+            <n-button class="button button-danger" attr-type="button" :disabled="recoveringId === recoveryEvent.id || !recoveryWorkerConfirmed || !recoveryNoOutputConfirmed" @click="recoverInterrupted('discard_after_review')">确认无输出并放弃旧事件</n-button>
+          </div>
+        </section>
+      </div>
     </Teleport>
   </div>
 </template>

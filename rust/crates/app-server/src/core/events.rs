@@ -510,7 +510,7 @@ pub async fn verify_recovery_claims(
     let mut expected = episode_numbers.to_vec();
     expected.sort_unstable();
     expected.dedup();
-    let valid = if action == "retry_after_review"
+    let valid = if matches!(action, "retry_after_review" | "discard_after_review")
         && matches!(event.status.as_str(), "processing" | "failed")
         && claims.is_empty()
     {
@@ -643,6 +643,110 @@ pub async fn recover_followup_no_output(
     };
     sqlx::query(&format!("UPDATE update_event SET status='failed', last_error=?, completed_at={timestamp}, updated_at={timestamp} WHERE id=? AND status=?"))
         .bind(new_error).bind(event_id).bind(status).execute(&mut *tx).await.map_err(EventError::Database)?;
+    tx.commit().await.map_err(EventError::Database)?;
+    get(pool, event_id).await
+}
+
+pub async fn discard_followup_no_output(
+    pool: &AnyPool,
+    event_id: i64,
+    storage_id: i64,
+    season_number: i64,
+    episode_numbers: &[i64],
+    mysql: bool,
+) -> Result<Event, EventError> {
+    let mut expected = episode_numbers.to_vec();
+    expected.sort_unstable();
+    expected.dedup();
+    if expected.is_empty() || expected.len() != episode_numbers.len() {
+        return Err(EventError::Invalid("invalid_followup_selection"));
+    }
+    let mut tx = pool.begin().await.map_err(EventError::Database)?;
+    let event_query = format!(
+        "SELECT kind, status, last_error FROM update_event WHERE id = ?{}",
+        if mysql { " FOR UPDATE" } else { "" }
+    );
+    let event = sqlx::query(&event_query)
+        .bind(event_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(EventError::Database)?
+        .ok_or(EventError::NotFound)?;
+    let kind = text(&event, "kind")?;
+    let status = text(&event, "status")?;
+    let last_error = optional_text(&event, "last_error")?;
+    if kind != "new_ep" || !["processing", "failed"].contains(&status.as_str()) {
+        return Err(EventError::Conflict("event_not_reviewable"));
+    }
+    let reviewed_no_output = last_error
+        .as_deref()
+        .is_some_and(|value| value.starts_with("INTERRUPTED_REVIEW_CONFIRMED_NO_OUTPUT"));
+    let claim_query = format!(
+        "SELECT show_storage_id, season_number, episode_number, status FROM show_episode_write_claim WHERE event_id = ? ORDER BY show_storage_id, season_number, episode_number{}",
+        if mysql { " FOR UPDATE" } else { "" }
+    );
+    let claims = sqlx::query(&claim_query)
+        .bind(event_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(EventError::Database)?;
+    let mut actual = Vec::with_capacity(claims.len());
+    for claim in &claims {
+        let claim_storage: i64 = claim
+            .try_get("show_storage_id")
+            .map_err(EventError::Database)?;
+        let claim_season: i64 = claim
+            .try_get("season_number")
+            .map_err(EventError::Database)?;
+        let claim_episode: i64 = claim
+            .try_get("episode_number")
+            .map_err(EventError::Database)?;
+        let claim_status = text(claim, "status")?;
+        let valid_status = match status.as_str() {
+            "processing" => claim_status == "reserved",
+            "failed" => {
+                claim_status == "uncertain" || (reviewed_no_output && claim_status == "reserved")
+            }
+            _ => false,
+        };
+        if claim_storage != storage_id || claim_season != season_number || !valid_status {
+            return Err(EventError::Conflict("write_claims_changed"));
+        }
+        actual.push(claim_episode);
+    }
+    actual.sort_unstable();
+    if !claims.is_empty() && actual != expected {
+        return Err(EventError::Conflict("write_claims_changed"));
+    }
+
+    if !claims.is_empty() {
+        let released = sqlx::query(
+            "DELETE FROM show_episode_write_claim WHERE event_id=? AND status IN ('reserved','uncertain')",
+        )
+        .bind(event_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(EventError::Database)?;
+        if released.rows_affected() as usize != expected.len() {
+            return Err(EventError::Conflict("write_claims_changed"));
+        }
+    }
+    let timestamp = if mysql {
+        "CURRENT_TIMESTAMP(3)"
+    } else {
+        "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
+    };
+    let updated = sqlx::query(&format!(
+        "UPDATE update_event SET status='skipped', last_error='FOLLOWUP_DISCARDED_AFTER_NO_OUTPUT_REVIEW', completed_at={timestamp}, updated_at={timestamp} WHERE id=? AND status=?"
+    ))
+    .bind(event_id)
+    .bind(status)
+    .execute(&mut *tx)
+    .await
+    .map_err(EventError::Database)?;
+    if updated.rows_affected() != 1 {
+        return Err(EventError::Conflict("event_changed_concurrently"));
+    }
     tx.commit().await.map_err(EventError::Database)?;
     get(pool, event_id).await
 }
