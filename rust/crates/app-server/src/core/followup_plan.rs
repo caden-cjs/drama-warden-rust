@@ -371,9 +371,8 @@ pub fn create_plan(
     shared_files: &[Value],
     today: &str,
     max_episodes: usize,
-    max_bytes: u64,
 ) -> Option<FollowupPlan> {
-    if season <= 0 || !valid_date(today) || max_episodes == 0 || max_bytes == 0 {
+    if season <= 0 || !valid_date(today) || max_episodes == 0 {
         return None;
     }
     let mut statuses = HashMap::new();
@@ -456,9 +455,7 @@ pub fn create_plan(
         if file.size == 0 {
             continue;
         }
-        if save_batch.len() >= max_episodes
-            || (!save_batch.is_empty() && estimated_bytes.saturating_add(file.size) > max_bytes)
-        {
+        if save_batch.len() >= max_episodes {
             break;
         }
         estimated_bytes = estimated_bytes.saturating_add(file.size);

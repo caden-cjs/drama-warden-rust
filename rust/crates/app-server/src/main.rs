@@ -776,8 +776,7 @@ async fn preview_followup(
         &stored_json,
         &files,
         &china_today(),
-        3,
-        8 * 1024 * 1024 * 1024,
+        10,
     ) else {
         return api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
