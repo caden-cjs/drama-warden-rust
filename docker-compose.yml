@@ -49,6 +49,7 @@ services:
       HOME: ${PLUGIN_HOME:-/app/data}
       TZ: ${TZ:-}
       DRAMA_WARDEN_PLUGIN_COMMANDS: ${DRAMA_WARDEN_PLUGIN_COMMANDS:-}
+      PLUGIN_CONFIG_ENCRYPTION_KEY: ${PLUGIN_CONFIG_ENCRYPTION_KEY:-}
       FOLLOWUP_AUTOMATION_ENABLED: ${FOLLOWUP_AUTOMATION_ENABLED:-}
       FOLLOWUP_SCAN_INTERVAL_MINUTES: ${FOLLOWUP_SCAN_INTERVAL_MINUTES:-}
       FOLLOWUP_AUTO_PROCESS: ${FOLLOWUP_AUTO_PROCESS:-}
@@ -57,8 +58,9 @@ services:
       LOCAL_STORAGE_SHARE_ROOT: /local-shares
     volumes:
       - drama-warden-data:/app/data
-      - quark-auth:${PLUGIN_HOME:-/app/data}/.quarkclouddrive
-      - pan115-auth:${PLUGIN_HOME:-/app/data}/.115cli/credentials
+      - ./data:/project-data
+      - ./.deploy-runtime/quark-auth:/app/data/.quarkclouddrive
+      - ./.deploy-runtime/115-auth:/app/data/.115cli/credentials
       - ./config:/app/config:ro
       - ./plugins:/app/plugins:ro
       - ${LOCAL_STORAGE_SHARE_ROOT_HOST:-./data/shares}:/local-shares:ro
@@ -93,10 +95,4 @@ services:
 
 volumes:
   drama-warden-data:
-  quark-auth:
-    name: ${QUARK_AUTH_VOLUME:-drama-warden-quark-auth}
-    external: ${QUARK_AUTH_EXTERNAL:-false}
-  pan115-auth:
-    name: ${PAN115_AUTH_VOLUME:-drama-warden-115-auth}
-    external: ${PAN115_AUTH_EXTERNAL:-false}
   drama-warden-mysql-data:

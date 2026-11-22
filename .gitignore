@@ -72,6 +72,7 @@ data/*
 
 # Never export local deployment, authentication, or agent state.
 .deploy-backups/
+.deploy-runtime/
 .crew/
 .omc/
 .superpowers/
