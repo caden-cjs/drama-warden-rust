@@ -1,6 +1,7 @@
 <script setup>
-import { computed, inject, onMounted, onUnmounted, ref } from 'vue';
-import { errorMessage, formatDate, providerTitle } from '../lib/format.js';
+import { computed, h, inject, onMounted, onUnmounted, ref } from 'vue';
+import { NButton, NTag } from 'naive-ui';
+import { errorMessage, formatDate, providerTitle, statusTagType } from '../lib/format.js';
 
 const api = inject('api');
 const notify = inject('notify');
@@ -77,6 +78,50 @@ const queueCanSubmit = computed(() => Boolean(
   queueForm.value.showId && queueForm.value.storageId && selectedQueueEpisode.value
       && queueForm.value.languages.length && subtitleProviders.value.length && !queueLoading.value,
 ));
+const jobColumns = [
+  {
+    title: '节目 / 集数', key: 'episode', minWidth: 200,
+    render: (job) => h('button', {
+      class: 'subtitle-job-main', type: 'button', onClick: () => { openDetails(job); },
+    }, [
+      h('span', { class: ['subtitle-job-mark', `job-${job.status}`] }, job.status === 'completed' ? '✓' : job.status === 'uncertain' ? '!' : 'S'),
+      h('span', { class: 'subtitle-job-copy' }, [
+        h('strong', {}, jobTitle(job)),
+        h('small', {}, `S${String(job.seasonNumber).padStart(2, '0')}E${String(job.episodeNumber).padStart(2, '0')} · 任务 #${job.id}`),
+      ]),
+    ]),
+  },
+  { title: '存储位置', key: 'storage', minWidth: 140, render: (job) => storageTitle(job) },
+  {
+    title: '任务状态', key: 'status', minWidth: 110,
+    render: (job) => h('span', { class: 'subtitle-job-status' }, [
+      h(NTag, {
+        class: 'app-status-tag', type: statusTagType(job.status), size: 'small', round: true, bordered: false,
+      }, { default: () => statusLabel(job.status) }),
+      job.errorCode ? h('small', { class: 'subtitle-error-code' }, job.errorCode) : null,
+    ]),
+  },
+  {
+    title: '语言 / 提供方', key: 'provider', minWidth: 150,
+    render: (job) => h('span', { class: 'subtitle-job-languages' }, [
+      h('strong', {}, (job.languages || []).map(languageLabel).join('、') || '—'),
+      h('small', {}, pluginById.value.get(job.providerId)?.label || job.providerId || '等待提供方'),
+    ]),
+  },
+  { title: '最近更新', key: 'updatedAt', width: 145, render: (job) => formatDate(job.updatedAt) },
+  {
+    title: '', key: 'actions', width: 120,
+    render: (job) => job.status === 'failed' && job.retryable
+      ? h(NButton, {
+        class: 'button button-secondary button-small', size: 'small', attrType: 'button',
+        disabled: retryingId.value === job.id, onClick: () => retryJob(job),
+      }, { default: () => retryingId.value === job.id ? '重试中…' : '安全重试' })
+      : h(NButton, {
+        class: 'icon-button small', quaternary: true, circle: true, attrType: 'button',
+        'aria-label': `查看字幕任务 ${job.id} 详情`, onClick: () => openDetails(job),
+      }, { default: () => '›' }),
+  },
+];
 
 function statusLabel(status) {
   return ({
@@ -256,8 +301,8 @@ onUnmounted(() => window.clearInterval(refreshTimer));
     <div class="page-intro">
       <div><h2>为已归档的视频补充旁路字幕。</h2><p>根据媒体库当前记录的唯一视频集排队；worker 写入前还会重新核对完整目录。</p></div>
       <div class="subtitle-page-actions">
-        <button class="button button-secondary" type="button" :disabled="refreshing" @click="load()"><span class="button-icon">⟳</span>{{ refreshing ? '正在刷新' : '刷新任务' }}</button>
-        <button class="button button-primary" type="button" @click="openQueue"><span>＋</span>添加字幕任务</button>
+        <n-button class="button button-secondary" attr-type="button" :disabled="refreshing" @click="load()"><span class="button-icon">⟳</span>{{ refreshing ? '正在刷新' : '刷新任务' }}</n-button>
+        <n-button class="button button-primary" attr-type="button" @click="openQueue"><span>＋</span>添加字幕任务</n-button>
       </div>
     </div>
 
@@ -271,65 +316,51 @@ onUnmounted(() => window.clearInterval(refreshTimer));
     <section class="panel subtitle-worker-card">
       <span class="automation-light" :class="{ enabled: worker.enabled }"></span>
       <div><strong>字幕 worker {{ worker.enabled ? '已启用' : '已停用' }}</strong><small>字幕提供方：{{ supportedProviders.length ? supportedProviders.join(' · ') : '未启用' }}<template v-if="worker.intervalMs"> · 检查间隔 {{ Math.round(worker.intervalMs / 1000) }} 秒</template></small></div>
-      <span v-if="worker.processing" class="status-chip chip-processing">任务执行中</span>
-      <span v-else class="status-chip" :class="worker.enabled ? 'chip-processed' : 'chip-muted'">{{ worker.enabled ? '运行中' : '已暂停' }}</span>
+      <n-tag class="app-status-tag" size="small" round :bordered="false" :type="worker.processing ? 'info' : worker.enabled ? 'success' : 'default'">{{ worker.processing ? '任务执行中' : worker.enabled ? '运行中' : '已暂停' }}</n-tag>
     </section>
 
-    <div v-if="loadError && hasLoaded" class="inline-alert error-alert"><span class="alert-symbol">!</span><div><strong>任务列表未能刷新</strong><p>{{ loadError }} 当前仍显示上次成功加载的数据。</p><button class="text-button" type="button" :disabled="refreshing" @click="load()">重试 <span>→</span></button></div></div>
-    <div v-else-if="loadError && !hasLoaded" class="inline-alert error-alert"><span class="alert-symbol">!</span><div><strong>字幕任务服务不可用</strong><p>{{ loadError }}</p><button class="text-button" type="button" :disabled="refreshing" @click="load()">重试 <span>→</span></button></div></div>
+    <div v-if="loadError && hasLoaded" class="inline-alert error-alert"><span class="alert-symbol">!</span><div><strong>任务列表未能刷新</strong><p>{{ loadError }} 当前仍显示上次成功加载的数据。</p><n-button class="text-button" attr-type="button" :disabled="refreshing" @click="load()">重试 <span>→</span></n-button></div></div>
+    <div v-else-if="loadError && !hasLoaded" class="inline-alert error-alert"><span class="alert-symbol">!</span><div><strong>字幕任务服务不可用</strong><p>{{ loadError }}</p><n-button class="text-button" attr-type="button" :disabled="refreshing" @click="load()">重试 <span>→</span></n-button></div></div>
 
     <section class="panel toolbar-panel subtitle-toolbar">
-      <div class="search-field"><span aria-hidden="true">⌕</span><input v-model="query" type="search" placeholder="搜索节目、集数、提供方或错误码" /></div>
-      <label class="subtitle-show-filter"><span class="sr-only">按节目筛选</span><select v-model="showFilter"><option value="all">所有节目</option><option v-for="show in shows" :key="show.id" :value="String(show.id)">{{ show.name }}</option></select></label>
-      <div class="filter-tabs subtitle-status-filter"><button v-for="option in statusOptions" :key="option.id" type="button" :class="{ selected: statusFilter === option.id }" @click="statusFilter = option.id">{{ option.label }}<small v-if="option.id !== 'all'">{{ counts[option.id] || 0 }}</small></button></div>
+      <div class="search-field"><span aria-hidden="true">⌕</span><n-input v-model:value="query" clearable type="search" placeholder="搜索节目、集数、提供方或错误码" /></div>
+      <label class="subtitle-show-filter"><span class="sr-only">按节目筛选</span><n-select v-model:value="showFilter" :options="[{ label: '所有节目', value: 'all' }, ...shows.map((show) => ({ label: show.name, value: String(show.id) }))]" /></label>
+      <div class="filter-tabs subtitle-status-filter"><n-button v-for="option in statusOptions" :key="option.id" attr-type="button" :class="{ selected: statusFilter === option.id }" @click="statusFilter = option.id">{{ option.label }}<small v-if="option.id !== 'all'">{{ counts[option.id] || 0 }}</small></n-button></div>
     </section>
 
-    <section class="panel subtitle-table-panel">
-      <div class="subtitle-table-heading"><span>节目 / 集数</span><span>存储位置</span><span>任务状态</span><span>语言 / 提供方</span><span>最近更新</span><span></span></div>
+    <n-card class="panel subtitle-table-panel" :bordered="false" content-style="padding: 0">
       <div v-if="loading" class="table-loading"><div v-for="index in 5" :key="index" class="skeleton-line"></div></div>
       <div v-else-if="!hasLoaded && loadError" class="empty-state compact-empty"><div class="empty-illustration">!</div><strong>无法加载字幕任务</strong><p>{{ loadError }}</p></div>
-      <div v-else-if="!filteredJobs.length" class="empty-state compact-empty"><div class="empty-illustration">▤</div><strong>{{ jobs.length ? '没有符合条件的任务' : '还没有字幕任务' }}</strong><p>{{ jobs.length ? '调整筛选条件，或为已扫描的唯一视频集添加任务。' : '添加任务后，worker 会搜索可用字幕并安全写入视频旁路文件。' }}</p><button v-if="!jobs.length" class="button button-primary" type="button" @click="openQueue">添加第一个任务</button></div>
-      <div v-else class="subtitle-job-list">
-        <article v-for="job in filteredJobs" :key="job.id" class="subtitle-job-row">
-          <button class="subtitle-job-main" type="button" @click="openDetails(job)">
-            <span class="subtitle-job-mark" :class="`job-${job.status}`">{{ job.status === 'completed' ? '✓' : job.status === 'uncertain' ? '!' : 'S' }}</span>
-            <span class="subtitle-job-copy"><strong>{{ jobTitle(job) }}</strong><small>S{{ String(job.seasonNumber).padStart(2, '0') }}E{{ String(job.episodeNumber).padStart(2, '0') }} · 任务 #{{ job.id }}</small></span>
-          </button>
-          <span class="subtitle-job-storage">{{ storageTitle(job) }}</span>
-          <span><span class="status-chip" :class="`chip-${job.status}`">{{ statusLabel(job.status) }}</span><small v-if="job.errorCode" class="subtitle-error-code">{{ job.errorCode }}</small></span>
-          <span class="subtitle-job-languages"><strong>{{ (job.languages || []).map(languageLabel).join('、') || '—' }}</strong><small>{{ pluginById.get(job.providerId)?.label || job.providerId || '等待提供方' }}</small></span>
-          <span class="subtitle-job-time">{{ formatDate(job.updatedAt) }}</span>
-          <span class="subtitle-job-actions"><button v-if="job.status === 'failed' && job.retryable" class="button button-secondary button-small" type="button" :disabled="retryingId === job.id" @click="retryJob(job)">{{ retryingId === job.id ? '重试中…' : '安全重试' }}</button><button v-else class="icon-button small" type="button" :aria-label="`查看字幕任务 ${job.id} 详情`" @click="openDetails(job)">›</button></span>
-        </article>
-      </div>
+      <div v-else-if="!filteredJobs.length" class="empty-state compact-empty"><div class="empty-illustration">▤</div><strong>{{ jobs.length ? '没有符合条件的任务' : '还没有字幕任务' }}</strong><p>{{ jobs.length ? '调整筛选条件，或为已扫描的唯一视频集添加任务。' : '添加任务后，worker 会搜索可用字幕并安全写入视频旁路文件。' }}</p><n-button v-if="!jobs.length" class="button button-primary" attr-type="button" @click="openQueue">添加第一个任务</n-button></div>
+      <n-data-table v-else :columns="jobColumns" :data="filteredJobs" :row-key="(job) => job.id" :bordered="false" :single-line="false" :scroll-x="850" />
       <div class="table-footer">显示最近 {{ jobs.length }} / 最多 500 项字幕任务。任务状态每 15 秒刷新一次。需核对任务不会提供重试入口。</div>
-    </section>
+    </n-card>
 
     <Teleport to="body">
       <div v-if="showQueue" class="modal-backdrop" @click.self="showQueue = false">
         <section class="modal modal-wide" role="dialog" aria-modal="true" aria-labelledby="subtitle-queue-title">
-          <div class="modal-heading"><div><span class="modal-kicker">字幕任务 / 新建</span><h2 id="subtitle-queue-title">添加单集字幕任务</h2><p>仅显示媒体库当前记录为唯一视频版本的集数；worker 会在写入前重新核对。</p></div><button class="icon-button" type="button" aria-label="关闭" @click="showQueue = false">×</button></div>
+          <div class="modal-heading"><div><span class="modal-kicker">字幕任务 / 新建</span><h2 id="subtitle-queue-title">添加单集字幕任务</h2><p>仅显示媒体库当前记录为唯一视频版本的集数；worker 会在写入前重新核对。</p></div><n-button class="icon-button" attr-type="button" aria-label="关闭" @click="showQueue = false">×</n-button></div>
           <div class="form-stack">
-            <label class="field"><span>节目</span><select v-model="queueForm.showId" @change="selectQueueShow"><option value="">选择一部剧集</option><option v-for="show in queueShows" :key="show.id" :value="String(show.id)">{{ show.name }}</option></select><small>字幕任务目前面向电视剧集；电影尚无 canonical 集数目录。</small></label>
-            <label class="field"><span>媒体库位置</span><select v-model="queueForm.storageId" :disabled="!queueForm.showId || queueLoading" @change="selectQueueStorage"><option value="">选择支持旁路字幕写入的位置</option><option v-for="storage in supportedQueueStorages" :key="storage.id" :value="String(storage.id)">{{ providerTitle(pluginById.get(storage.providerId)) }} · 位置 #{{ storage.id }}</option></select><small>只有启用 `writeSidecar` 能力的存储插件会显示。当前夸克和 115 不支持字幕写入。</small></label>
-            <label class="field"><span>季 / 集</span><select v-model="queueForm.episodeKey" :disabled="!queueEligibleEpisodes.length || queueLoading"><option value="">{{ queueLoading ? '正在读取媒体库集数…' : '选择季和集数' }}</option><option v-for="episode in queueEligibleEpisodes" :key="`${episode.seasonNumber}:${episode.episodeNumber}`" :value="`${episode.seasonNumber}:${episode.episodeNumber}`">{{ episodeLabel(episode) }}</option></select><small v-if="queueEpisodes.length">媒体库记录 {{ queueEpisodes.filter((episode) => episode.status === 'present' && episode.assetCount === 1).length }} 个唯一视频集；{{ queuedEpisodeCount }} 集已有任务；{{ conflictEpisodeCount }} 集存在多个视频版本。任务执行前会重新读取完整目录；若清单不完整或资产有变化，不会开始字幕写入。</small><small v-else>请先在节目详情中扫描所选媒体库位置。</small></label>
-            <fieldset class="subtitle-language-field"><legend>字幕语言</legend><label><input v-model="queueForm.languages" type="checkbox" value="zh-CN" /> 简体中文</label><label><input v-model="queueForm.languages" type="checkbox" value="zh-TW" /> 繁体中文</label><label><input v-model="queueForm.languages" type="checkbox" value="en" /> 英语</label></fieldset>
+            <label class="field"><span>节目</span><n-select v-model:value="queueForm.showId" placeholder="选择一部剧集" :options="queueShows.map((show) => ({ label: show.name, value: String(show.id) }))" @update:value="selectQueueShow" /><small>字幕任务目前面向电视剧集；电影尚无 canonical 集数目录。</small></label>
+            <label class="field"><span>媒体库位置</span><n-select v-model:value="queueForm.storageId" placeholder="选择支持旁路字幕写入的位置" :options="supportedQueueStorages.map((storage) => ({ label: `${providerTitle(pluginById.get(storage.providerId))} · 位置 #${storage.id}`, value: String(storage.id) }))" :disabled="!queueForm.showId || queueLoading" @update:value="selectQueueStorage" /><small>只有启用 `writeSidecar` 能力的存储插件会显示。当前夸克和 115 不支持字幕写入。</small></label>
+            <label class="field"><span>季 / 集</span><n-select v-model:value="queueForm.episodeKey" :placeholder="queueLoading ? '正在读取媒体库集数…' : '选择季和集数'" :options="queueEligibleEpisodes.map((episode) => ({ label: episodeLabel(episode), value: `${episode.seasonNumber}:${episode.episodeNumber}` }))" :disabled="!queueEligibleEpisodes.length || queueLoading" /><small v-if="queueEpisodes.length">媒体库记录 {{ queueEpisodes.filter((episode) => episode.status === 'present' && episode.assetCount === 1).length }} 个唯一视频集；{{ queuedEpisodeCount }} 集已有任务；{{ conflictEpisodeCount }} 集存在多个视频版本。任务执行前会重新读取完整目录；若清单不完整或资产有变化，不会开始字幕写入。</small><small v-else>请先在节目详情中扫描所选媒体库位置。</small></label>
+            <fieldset class="subtitle-language-field"><legend>字幕语言</legend><n-checkbox-group v-model:value="queueForm.languages"><n-checkbox value="zh-CN">简体中文</n-checkbox><n-checkbox value="zh-TW">繁体中文</n-checkbox><n-checkbox value="en">英语</n-checkbox></n-checkbox-group></fieldset>
             <div v-if="queueError" class="inline-alert error-alert"><span class="alert-symbol">!</span><div><strong>无法读取可选目标</strong><p>{{ queueError }}</p></div></div>
             <div v-if="!subtitleProviders.length" class="inline-alert warning-alert"><span class="alert-symbol">!</span><div><strong>没有启用的字幕提供方</strong><p>先在服务端配置 OpenSubtitles API key，或启用 Assrt provider，再创建任务。</p></div></div>
             <div v-else-if="!worker.enabled" class="inline-alert warning-alert"><span class="alert-symbol">!</span><div><strong>字幕 worker 已停用</strong><p>任务可以排队，但 worker 不会处理，直到服务端重新启用字幕 worker。</p></div></div>
             <div class="helper-panel">任务只会写入匹配视频旁边的新字幕文件。若写入状态不确定，系统会暂停任务以供人工核对，不会自动覆盖或重试。</div>
-            <div class="modal-actions"><button class="button button-quiet" type="button" :disabled="queueing" @click="showQueue = false">取消</button><button class="button button-primary" type="button" :disabled="!queueCanSubmit || queueing" @click="queueSubtitle">{{ queueing ? '正在排队…' : '加入任务队列' }}</button></div>
+            <div class="modal-actions"><n-button class="button button-quiet" attr-type="button" :disabled="queueing" @click="showQueue = false">取消</n-button><n-button class="button button-primary" attr-type="button" :disabled="!queueCanSubmit || queueing" @click="queueSubtitle">{{ queueing ? '正在排队…' : '加入任务队列' }}</n-button></div>
           </div>
         </section>
       </div>
 
       <div v-if="selectedJob" class="modal-backdrop" @click.self="selectedJob = null">
         <section class="modal" role="dialog" aria-modal="true" aria-labelledby="subtitle-job-detail-title">
-          <div class="modal-heading"><div><span class="modal-kicker">字幕任务 / #{{ selectedJob.id }}</span><h2 id="subtitle-job-detail-title">{{ jobTitle(selectedJob) }}</h2><p>S{{ String(selectedJob.seasonNumber).padStart(2, '0') }}E{{ String(selectedJob.episodeNumber).padStart(2, '0') }} · {{ storageTitle(selectedJob) }}</p></div><button class="icon-button" type="button" aria-label="关闭" @click="selectedJob = null">×</button></div>
+          <div class="modal-heading"><div><span class="modal-kicker">字幕任务 / #{{ selectedJob.id }}</span><h2 id="subtitle-job-detail-title">{{ jobTitle(selectedJob) }}</h2><p>S{{ String(selectedJob.seasonNumber).padStart(2, '0') }}E{{ String(selectedJob.episodeNumber).padStart(2, '0') }} · {{ storageTitle(selectedJob) }}</p></div><n-button class="icon-button" attr-type="button" aria-label="关闭" @click="selectedJob = null">×</n-button></div>
           <div v-if="detailsLoading" class="loading-modal"><span class="spinner"></span>正在读取任务详情…</div>
           <template v-else>
             <div class="event-detail-facts">
-              <div><span>状态</span><strong><span class="status-chip" :class="`chip-${selectedJob.status}`">{{ statusLabel(selectedJob.status) }}</span></strong></div>
+              <div><span>状态</span><strong><n-tag class="app-status-tag" size="small" round :bordered="false" :type="statusTagType(selectedJob.status)">{{ statusLabel(selectedJob.status) }}</n-tag></strong></div>
               <div><span>尝试次数</span><strong>{{ selectedJob.attemptCount }}</strong></div>
               <div><span>目标语言</span><strong>{{ (selectedJob.languages || []).map(languageLabel).join('、') || '—' }}</strong></div>
               <div><span>字幕提供方</span><strong>{{ pluginById.get(selectedJob.providerId)?.label || selectedJob.providerId || '尚未选择' }}</strong></div>
@@ -339,7 +370,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
             <div v-if="selectedJob.nextAttemptAt && selectedJob.status === 'pending'" class="helper-panel">下次尝试时间：{{ formatDate(selectedJob.nextAttemptAt) }}</div>
             <div v-if="selectedJob.outputPath" class="helper-panel subtitle-output-path"><strong>写入路径</strong><span>{{ selectedJob.outputPath }}</span></div>
             <div v-if="selectedJob.errorCode" class="inline-alert" :class="selectedJob.status === 'uncertain' ? 'warning-alert' : 'error-alert'"><span class="alert-symbol">!</span><div><strong>{{ selectedJob.status === 'uncertain' ? '写入结果需要人工核对' : '任务错误代码' }}</strong><p>{{ selectedJob.errorCode }}<template v-if="selectedJob.status === 'uncertain'">。请先检查目标目录中是否已生成字幕文件；确认前不要重复写入。</template></p></div></div>
-            <div class="modal-actions"><button class="button button-quiet" type="button" @click="selectedJob = null">关闭</button><button v-if="selectedJob.status === 'failed' && selectedJob.retryable" class="button button-secondary" type="button" :disabled="retryingId === selectedJob.id" @click="retryJob(selectedJob)">{{ retryingId === selectedJob.id ? '正在重试…' : '安全重试' }}</button></div>
+            <div class="modal-actions"><n-button class="button button-quiet" attr-type="button" @click="selectedJob = null">关闭</n-button><n-button v-if="selectedJob.status === 'failed' && selectedJob.retryable" class="button button-secondary" attr-type="button" :disabled="retryingId === selectedJob.id" @click="retryJob(selectedJob)">{{ retryingId === selectedJob.id ? '正在重试…' : '安全重试' }}</n-button></div>
           </template>
         </section>
       </div>
@@ -357,11 +388,11 @@ onUnmounted(() => window.clearInterval(refreshTimer));
 .subtitle-metrics .metric-card { min-height: 137px; }
 .subtitle-toolbar { flex-wrap: wrap; }
 .subtitle-toolbar .search-field { flex: 1 1 260px; }
-.subtitle-show-filter select { min-height: 34px; max-width: 210px; padding: 0 10px; border: 1px solid #e6eaf0; border-radius: 8px; background: #fff; color: #69758a; font-size: 12px; }
+.subtitle-show-filter .n-select { width: 210px; max-width: 100%; }
 .subtitle-status-filter { width: 100%; overflow-x: auto; flex-wrap: nowrap; }
 .subtitle-status-filter button { display: inline-flex; align-items: center; gap: 5px; flex: 0 0 auto; }
 .subtitle-status-filter small { color: #a3adba; font-size: 12px; }
-.subtitle-table-panel { overflow: hidden; }
+.subtitle-table-panel { min-width: 0; }
 .subtitle-table-heading, .subtitle-job-row { display: grid; grid-template-columns: minmax(205px, 1.35fr) minmax(105px, .7fr) minmax(88px, .55fr) minmax(125px, .8fr) minmax(95px, .55fr) auto; align-items: center; gap: 12px; padding: 12px 17px; }
 .subtitle-table-heading { border-bottom: 1px solid #edf0f5; background: #fbfcfe; color: #9ca5b3; font-size: 12px; font-weight: 700; }
 .subtitle-job-row { min-height: 68px; border-bottom: 1px solid #f0f2f6; }
@@ -386,7 +417,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
 .subtitle-language-field { display: flex; flex-wrap: wrap; gap: 10px 18px; margin: 0; padding: 11px 12px; border: 1px solid #e9edf3; border-radius: 8px; color: #68758a; font-size: 12px; }
 .subtitle-language-field legend { padding: 0 5px; color: #5d687c; font-size: 13px; font-weight: 600; }
 .subtitle-language-field label { display: inline-flex; align-items: center; gap: 5px; }
-.subtitle-language-field input { accent-color: #3978f6; }
+.subtitle-language-field .n-checkbox-group { display: flex; flex-wrap: wrap; gap: 10px 18px; }
 .subtitle-output-path { display: grid; gap: 5px; margin: 11px 0; }
 .subtitle-output-path strong { color: #69758a; font-size: 12px; }
 .subtitle-output-path span { overflow-wrap: anywhere; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
@@ -402,7 +433,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
   .subtitle-page-actions { width: 100%; justify-content: flex-start; }
   .subtitle-page-actions .button { flex: 1; }
   .subtitle-toolbar .search-field { flex-basis: 100%; }
-  .subtitle-show-filter, .subtitle-show-filter select { width: 100%; max-width: none; }
+  .subtitle-show-filter, .subtitle-show-filter .n-select { width: 100%; max-width: none; }
   .subtitle-job-row { grid-template-columns: minmax(0, 1fr) auto; gap: 8px; padding: 11px 12px; }
   .subtitle-job-main { grid-column: 1; grid-row: 1 / span 2; }
   .subtitle-job-storage { display: none; }
@@ -410,4 +441,18 @@ onUnmounted(() => window.clearInterval(refreshTimer));
   .subtitle-job-time { grid-column: 2; grid-row: 2; text-align: right; }
   .subtitle-job-actions { grid-column: 2; grid-row: 3; }
 }
+
+:deep(.subtitle-job-main) { display: flex; min-width: 0; align-items: center; gap: 9px; padding: 0; border: 0; background: transparent; cursor: pointer; text-align: left; }
+:deep(.subtitle-job-main:hover .subtitle-job-copy strong) { color: #3978f6; }
+:deep(.subtitle-job-mark) { display: grid; width: 30px; height: 30px; flex: 0 0 30px; place-items: center; border-radius: 9px; background: #f1f4f8; color: #768397; font-size: 14px; font-weight: 800; }
+:deep(.subtitle-job-mark.job-completed) { background: #e8f8f1; color: #1c9c72; }
+:deep(.subtitle-job-mark.job-pending) { background: #fff5e6; color: #c68428; }
+:deep(.subtitle-job-mark.job-processing) { background: #edf4ff; color: #3c74d7; }
+:deep(.subtitle-job-mark.job-failed) { background: #fff0f0; color: #d45959; }
+:deep(.subtitle-job-mark.job-uncertain) { background: #fff2e6; color: #bd762a; }
+:deep(.subtitle-job-copy), :deep(.subtitle-job-languages) { display: block; min-width: 0; }
+:deep(.subtitle-job-copy strong), :deep(.subtitle-job-copy small), :deep(.subtitle-job-languages strong), :deep(.subtitle-job-languages small) { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+:deep(.subtitle-job-copy strong), :deep(.subtitle-job-languages strong) { color: #465167; font-size: 12px; }
+:deep(.subtitle-job-copy small), :deep(.subtitle-job-languages small) { margin-top: 5px; color: #9da6b4; font-size: 12px; }
+:deep(.subtitle-job-status) { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; }
 </style>

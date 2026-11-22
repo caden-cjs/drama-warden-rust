@@ -1,6 +1,6 @@
 <script setup>
 import { computed, inject, onMounted, ref } from 'vue';
-import { errorMessage, eventTitle, formatDate, statusLabel } from '../lib/format.js';
+import { errorMessage, eventTitle, formatDate, statusLabel, statusTagType } from '../lib/format.js';
 
 const api = inject('api');
 const notify = inject('notify');
@@ -36,7 +36,17 @@ async function load() {
   if (showResult.status === 'fulfilled') shows.value = showResult.value.items || [];
   if (eventResult.status === 'fulfilled') events.value = eventResult.value.items || [];
   if (pluginResult.status === 'fulfilled') plugins.value = pluginResult.value.items || [];
-  if (automationResult.status === 'fulfilled') automation.value = automationResult.value.automation;
+  if (automationResult.status === 'fulfilled') {
+    const response = automationResult.value;
+    const settings = response.settings || {};
+    automation.value = {
+      enabled: settings.followupAutomationEnabled ?? response.enabled ?? false,
+      intervalMinutes: settings.followupScanIntervalMinutes ?? response.intervalMinutes ?? 30,
+      autoProcess: settings.followupAutoProcess ?? response.autoProcess ?? false,
+      running: response.running ?? false,
+      lastRun: response.lastRun ?? null,
+    };
+  }
   if (healthResult.status === 'fulfilled') health.value = healthResult.value;
   const rejected = results.find((result) => result.status === 'rejected');
   if (rejected) loadError.value = errorMessage(rejected.reason);
@@ -66,9 +76,9 @@ onMounted(load);
         <h2>追更状态，一目了然。</h2>
         <p>查看节目进度、待处理事件和自动化运行情况。</p>
       </div>
-      <button class="button button-secondary" type="button" :disabled="loading" @click="load">
+      <n-button class="button button-secondary" attr-type="button" :disabled="loading" @click="load">
         <span class="button-icon">⟳</span>{{ loading ? '正在刷新' : '刷新数据' }}
-      </button>
+      </n-button>
     </div>
 
     <div v-if="loadError" class="inline-alert error-alert">
@@ -77,38 +87,38 @@ onMounted(load);
     </div>
 
     <div class="metric-grid">
-      <article class="metric-card">
+      <n-card class="metric-card" :bordered="false" content-style="padding: 0">
         <div class="metric-top"><span>追更中的节目</span><span class="metric-icon lilac">▣</span></div>
         <div class="metric-value">{{ openShows }}<small> / {{ shows.length }} 部</small></div>
         <div class="metric-foot">已完成节目 {{ shows.length - openShows }} 部</div>
-      </article>
-      <article class="metric-card">
+      </n-card>
+      <n-card class="metric-card" :bordered="false" content-style="padding: 0">
         <div class="metric-top"><span>待处理事件</span><span class="metric-icon amber">↻</span></div>
         <div class="metric-value">{{ pendingEvents.length }}<small> 条</small></div>
         <div class="metric-foot">处理中 {{ processingEvents.length }} · 最近 {{ events.length }} 条事件</div>
-      </article>
-      <article class="metric-card">
+      </n-card>
+      <n-card class="metric-card" :bordered="false" content-style="padding: 0">
         <div class="metric-top"><span>已启用插件</span><span class="metric-icon mint">◇</span></div>
         <div class="metric-value">{{ enabledPlugins }}<small> / {{ plugins.length }} 个</small></div>
         <div class="metric-foot">插件通过能力契约接入</div>
-      </article>
-      <article class="metric-card">
+      </n-card>
+      <n-card class="metric-card" :bordered="false" content-style="padding: 0">
         <div class="metric-top"><span>数据库状态</span><span class="metric-icon blue">⌁</span></div>
         <div class="metric-value metric-state" :class="health?.database === 'ok' ? 'text-good' : 'text-muted'">
           {{ health?.database === 'ok' ? '正常' : health?.database === 'unavailable' ? '不可用' : '检查中' }}
         </div>
         <div class="metric-foot">{{ health?.service || 'drama-warden' }} 服务健康检查</div>
-      </article>
+      </n-card>
     </div>
 
     <section v-if="failedEvents.length" class="panel dashboard-attention">
       <div class="attention-mark">!</div>
       <div class="attention-copy"><strong>{{ failedEvents.length }} 条事件需要关注</strong><span>{{ uncertainEvents.length ? `${uncertainEvents.length} 条需要先核对写入结果` : '可在追更事件中查看失败原因并安全重试' }}</span></div>
-      <span class="status-chip chip-failed">{{ uncertainEvents.length }} 条需核对</span>
+      <n-tag class="app-status-tag" size="small" round :bordered="false" type="warning">{{ uncertainEvents.length }} 条需核对</n-tag>
     </section>
 
     <div class="content-grid overview-grid">
-      <section class="panel panel-large">
+      <n-card class="panel panel-large" :bordered="false" content-style="padding: 0">
         <div class="panel-heading">
           <div><h3>最近追更事件</h3><p>查看最新状态与处理结果</p></div>
           <span class="subtle-count">{{ events.length }} 条记录</span>
@@ -123,12 +133,12 @@ onMounted(load);
               <strong>{{ eventTitle(event) }}</strong>
               <small>{{ event.kind }} <span>·</span> {{ event.source || 'manual' }} <span>·</span> {{ formatDate(event.createdAt) }}</small>
             </div>
-            <span class="status-chip" :class="'chip-' + event.status">{{ statusLabel(event.status) }}</span>
+            <n-tag class="app-status-tag" size="small" round :bordered="false" :type="statusTagType(event.status)">{{ statusLabel(event.status) }}</n-tag>
           </div>
         </div>
-      </section>
+      </n-card>
 
-      <section class="panel automation-panel">
+      <n-card class="panel automation-panel" :bordered="false" content-style="padding: 0">
         <div class="panel-heading">
           <div><h3>自动化</h3><p>只读扫描预览</p></div>
           <span class="automation-light" :class="automation?.enabled ? 'enabled' : ''"></span>
@@ -145,18 +155,18 @@ onMounted(load);
           <div><span>最近扫描</span><strong>{{ formatDate(automation?.lastRun?.completedAt || automation?.lastStartedAt) }}</strong></div>
           <div><span>本次运行</span><strong>{{ automation?.running ? '运行中' : '空闲' }}</strong></div>
         </div>
-        <button class="button button-primary button-full" type="button" :disabled="scanLoading" @click="runScan">
+        <n-button class="button button-primary button-full" attr-type="button" :disabled="scanLoading" @click="runScan">
           {{ scanLoading ? '正在扫描候选…' : '运行只读预览' }}
           <span aria-hidden="true">→</span>
-        </button>
+        </n-button>
         <p class="helper-note">此预览不会排队事件，也不会写入媒体文件。</p>
-      </section>
+      </n-card>
     </div>
 
-    <section v-if="scanResult" class="panel scan-panel">
+    <n-card v-if="scanResult" class="panel scan-panel" :bordered="false" content-style="padding: 0">
       <div class="panel-heading">
         <div><h3>最近一次预览</h3><p>完成于 {{ formatDate(scanResult.completedAt) }}</p></div>
-        <span class="status-chip chip-processed">只读预览</span>
+        <n-tag class="app-status-tag" size="small" round :bordered="false" type="success">只读预览</n-tag>
       </div>
       <div class="scan-summary">
         <div><strong>{{ scanResult.showsChecked || 0 }}</strong><span>检查节目</span></div>
@@ -169,12 +179,12 @@ onMounted(load);
         <div v-for="(candidate, index) in scanCandidates.slice(0, 8)" :key="`${candidate.storageId}-${candidate.sourceId || index}`" class="candidate-row">
           <div><strong>{{ candidate.showName }}</strong><small>{{ candidate.title || '未命名资源' }}</small></div>
           <span>{{ candidate.providerId }}</span>
-          <span class="status-chip" :class="candidate.preview?.eligible && candidate.searchComplete ? 'chip-processed' : 'chip-muted'">
+          <n-tag class="app-status-tag" size="small" round :bordered="false" :type="candidate.preview?.eligible && candidate.searchComplete ? 'success' : 'warning'">
             {{ candidate.preview?.eligible ? '可追更' : '需复核' }}
-          </span>
+          </n-tag>
         </div>
       </div>
       <p v-else class="empty-note">本次没有发现资源候选。</p>
-    </section>
+    </n-card>
   </div>
 </template>
