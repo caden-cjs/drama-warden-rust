@@ -633,7 +633,7 @@ async fn process_inner(
     )
     .await
     .map_err(|_| fail("EVENT_FINALIZE_FAILED", context))?;
-    let notification = events::notification_event(&finished);
+    let notification = events::notification_event(pool, mysql, &finished).await;
     let _ = plugins.publish_event(notification).await;
     Ok(
         json!({"ok":true,"event":finished,"episodeNumbers":episode_numbers,"indexResult":index_result}),
@@ -671,7 +671,7 @@ pub async fn process_event(
                 mysql,
             )
             .await?;
-            let notification = events::notification_event(&event);
+            let notification = events::notification_event(pool, mysql, &event).await;
             let _ = plugins.publish_event(notification).await;
             Ok(json!({"ok":false,"event":event,"stage":error.stage,"errorCode":error.code}))
         }
@@ -1034,7 +1034,7 @@ pub async fn recover_event(
         mysql,
     )
     .await?;
-    let notification = events::notification_event(&event);
+    let notification = events::notification_event(pool, mysql, &event).await;
     let _ = plugins.publish_event(notification).await;
     Ok(
         json!({"ok":true,"event":event,"resolution":"processed","episodeNumbers":episode_numbers,"indexResult":index_result}),

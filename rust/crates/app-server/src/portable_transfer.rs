@@ -25,6 +25,7 @@ const TABLES: &[&str] = &[
     "plugin_call_log",
     "plugin_configuration",
     "plugin_config_audit",
+    "automation_scan_run",
 ];
 
 const VERSION_3_TABLES: &[&str] = &[
@@ -74,6 +75,24 @@ const VERSION_5_TABLES: &[&str] = &[
     "plugin_call_log",
 ];
 
+const VERSION_6_TABLES: &[&str] = &[
+    "shows",
+    "show_metadata_identity",
+    "show_season",
+    "show_episode",
+    "show_episode_metadata",
+    "show_storage",
+    "show_episode_asset",
+    "show_episode_storage",
+    "show_episode_write_claim",
+    "update_event",
+    "subtitle_job",
+    "application_setting",
+    "plugin_call_log",
+    "plugin_configuration",
+    "plugin_config_audit",
+];
+
 const MAX_IMPORT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const BINARY_MARKER: &str = "$dramaWardenBinaryV1";
 const PRIMARY_KEYS: &[(&str, &str)] = &[
@@ -92,6 +111,7 @@ const PRIMARY_KEYS: &[(&str, &str)] = &[
     ("plugin_call_log", "id"),
     ("plugin_configuration", "plugin_id"),
     ("plugin_config_audit", "id"),
+    ("automation_scan_run", "id"),
 ];
 
 struct TableExport<'a> {
@@ -176,7 +196,7 @@ fn validate_snapshot(snapshot: &Value) -> Result<(i64, HashMap<&str, TableExport
     let version = object
         .get("schemaVersion")
         .and_then(Value::as_i64)
-        .filter(|version| [3, 4, 5, 6].contains(version))
+        .filter(|version| [3, 4, 5, 6, 7].contains(version))
         .ok_or_else(|| "unsupported Drama Warden database export schema".to_owned())?;
     if object.get("format").and_then(Value::as_str) != Some("drama-warden-database-export")
         || object.get("formatVersion").and_then(Value::as_i64) != Some(1)
@@ -195,6 +215,7 @@ fn validate_snapshot(snapshot: &Value) -> Result<(i64, HashMap<&str, TableExport
         3 => VERSION_3_TABLES,
         4 => VERSION_4_TABLES,
         5 => VERSION_5_TABLES,
+        6 => VERSION_6_TABLES,
         _ => TABLES,
     };
     if tables_value.len() != expected.len()
@@ -215,6 +236,7 @@ fn table_optional_for_schema(version: i64, table: &str) -> bool {
     match table {
         "plugin_call_log" => version < 4,
         "plugin_configuration" | "plugin_config_audit" => version < 6,
+        "automation_scan_run" => version < 7,
         _ => false,
     }
 }
@@ -254,6 +276,7 @@ fn is_json_column(table: &str, column: &str) -> bool {
             | ("update_event", "payload_json")
             | ("subtitle_job", "languages_json")
             | ("application_setting", "value_json")
+            | ("automation_scan_run", "errors_json")
     )
 }
 
@@ -488,7 +511,7 @@ pub async fn export_snapshot(pool: &sqlx::AnyPool, driver: &str) -> Result<Value
     Ok(serde_json::json!({
         "format": "drama-warden-database-export",
         "formatVersion": 1,
-        "schemaVersion": 6,
+        "schemaVersion": 7,
         "sourceDriver": driver,
         "exportedAt": portable_timestamp(&exported_at),
         "tables": exported_tables,

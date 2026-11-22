@@ -551,6 +551,13 @@ struct EventListQuery {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct AutomationRunListQuery {
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct PluginCallQuery {
     plugin_id: Option<String>,
     capability: Option<String>,
@@ -1219,6 +1226,7 @@ async fn run_automation_scan(
     state: &AppState,
     queue_candidates: bool,
     process_queued: bool,
+    run_type: &'static str,
 ) -> serde_json::Value {
     {
         let mut status = state.automation_status.lock().await;
@@ -1261,7 +1269,18 @@ async fn run_automation_scan(
                         {
                             events_processed += 1
                         }
-                        Ok(_) => events_failed += 1,
+                        Ok(result) => {
+                            events_failed += 1;
+                            if errors.len() < 100 {
+                                let error_code = result
+                                    .get("errorCode")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("AUTOMATION_EVENT_PROCESS_FAILED");
+                                errors.push(serde_json::json!({
+                                    "eventId":event.id,"errorCode":error_code,
+                                }));
+                            }
+                        }
                         Err(error) => {
                             events_failed += 1;
                             if errors.len() < 100 {
@@ -1380,6 +1399,15 @@ async fn run_automation_scan(
                                     == Some(true)
                             {
                                 events_queued += 1;
+                            } else if !status.is_success() && errors.len() < 100 {
+                                let error_code = result
+                                    .get("code")
+                                    .or_else(|| result.get("errorCode"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("AUTOMATION_QUEUE_FAILED");
+                                errors.push(serde_json::json!({
+                                    "showId":show.id,"storageId":storage.id,"errorCode":error_code,
+                                }));
                             }
                         }
                     }
@@ -1393,45 +1421,99 @@ async fn run_automation_scan(
     }
 
     if process_queued {
-        if let Ok(events) = core::events::list(&state.database.pool, Some("pending"), 1000, 0).await
-        {
-            for event in events
-                .into_iter()
-                .filter(|event| event.kind == "new_ep" && event.source == "automation")
-            {
-                match core::followup::process_event(
-                    &state.database.pool,
-                    &state.plugins,
-                    event.id,
-                    mysql,
-                )
-                .await
+        match core::events::list(&state.database.pool, Some("pending"), 1000, 0).await {
+            Ok(events) => {
+                for event in events
+                    .into_iter()
+                    .filter(|event| event.kind == "new_ep" && event.source == "automation")
                 {
-                    Ok(result)
-                        if result.get("ok").and_then(serde_json::Value::as_bool) == Some(true) =>
+                    match core::followup::process_event(
+                        &state.database.pool,
+                        &state.plugins,
+                        event.id,
+                        mysql,
+                    )
+                    .await
                     {
-                        events_processed += 1
+                        Ok(result)
+                            if result.get("ok").and_then(serde_json::Value::as_bool)
+                                == Some(true) =>
+                        {
+                            events_processed += 1
+                        }
+                        Ok(result) => {
+                            events_failed += 1;
+                            if errors.len() < 100 {
+                                let error_code = result
+                                    .get("errorCode")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("AUTOMATION_EVENT_PROCESS_FAILED");
+                                errors.push(serde_json::json!({
+                                    "eventId":event.id,"errorCode":error_code,
+                                }));
+                            }
+                        }
+                        Err(error) => {
+                            events_failed += 1;
+                            if errors.len() < 100 {
+                                errors.push(serde_json::json!({
+                                    "eventId":event.id,"errorCode":event_error_code(&error),
+                                }));
+                            }
+                        }
                     }
-                    Ok(_) => events_failed += 1,
-                    Err(_) => events_failed += 1,
                 }
             }
+            Err(error) if errors.len() < 100 => {
+                errors.push(serde_json::json!({"errorCode":event_error_code(&error)}));
+            }
+            Err(_) => {}
         }
     }
     let completed_at = timestamp_utc();
+    let error_count = errors.len() as i64;
+    let errors_json = serde_json::to_string(&errors).unwrap_or_else(|_| "[]".to_owned());
+    let history_saved = match core::automation_runs::insert(
+        &state.database.pool,
+        core::automation_runs::NewAutomationRun {
+            run_type,
+            started_at: &started_at,
+            completed_at: &completed_at,
+            shows_checked: shows_checked as i64,
+            storages_checked: storages_checked as i64,
+            candidates_found: candidates_found as i64,
+            eligible_candidates: eligible_candidates as i64,
+            events_queued: events_queued as i64,
+            events_processed: events_processed as i64,
+            events_failed: events_failed as i64,
+            storage_limit_reached,
+            error_count,
+            errors_json: &errors_json,
+        },
+    )
+    .await
+    {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::error!(error = %error, run_type, "automation scan history write failed");
+            false
+        }
+    };
     let result = serde_json::json!({
-        "startedAt":started_at,"completedAt":completed_at,"showsChecked":shows_checked,
+        "runType":run_type,"startedAt":started_at,"completedAt":completed_at,"showsChecked":shows_checked,
         "storagesChecked":storages_checked,"candidatesFound":candidates_found,
         "eligibleCandidates":eligible_candidates,"eventsQueued":events_queued,
         "eventsProcessed":events_processed,"eventsFailed":events_failed,
         "storageLimitReached":storage_limit_reached,"errors":errors,"candidates":candidates,
+        "historySaved":history_saved,
     });
     let summary = serde_json::json!({
-        "startedAt":started_at,"completedAt":completed_at,"showsChecked":shows_checked,
+        "runType":run_type,"startedAt":started_at,"completedAt":completed_at,"showsChecked":shows_checked,
         "storagesChecked":storages_checked,"candidatesFound":candidates_found,
         "eligibleCandidates":eligible_candidates,"eventsQueued":events_queued,
         "eventsProcessed":events_processed,"eventsFailed":events_failed,
-        "errorCount":errors.len(),"storageLimitReached":storage_limit_reached,
+        "errorCount":error_count,"storageLimitReached":storage_limit_reached,
+        "historySaved":history_saved,
     });
     let mut status = state.automation_status.lock().await;
     status.running = false;
@@ -1445,7 +1527,7 @@ async fn run_scheduler(
 ) {
     let mut settings = updates.borrow().clone();
     if settings.followup_automation_enabled {
-        run_automation_scan(&state, true, settings.followup_auto_process).await;
+        run_automation_scan(&state, true, settings.followup_auto_process, "scheduled").await;
     }
     loop {
         if !settings.followup_automation_enabled {
@@ -1455,7 +1537,7 @@ async fn run_scheduler(
         } else {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs((settings.followup_scan_interval_minutes as u64) * 60)) => {
-                    run_automation_scan(&state, true, settings.followup_auto_process).await;
+                    run_automation_scan(&state, true, settings.followup_auto_process, "scheduled").await;
                 }
                 changed = updates.changed() => if changed.is_err() { break; },
             }
@@ -1464,7 +1546,7 @@ async fn run_scheduler(
         let enabling = !settings.followup_automation_enabled && next.followup_automation_enabled;
         settings = next;
         if enabling {
-            run_automation_scan(&state, true, settings.followup_auto_process).await;
+            run_automation_scan(&state, true, settings.followup_auto_process, "scheduled").await;
         }
     }
 }
@@ -1662,7 +1744,12 @@ async fn transition_event(
     )
     .await?;
     if matches!(event.status.as_str(), "processed" | "skipped" | "failed") {
-        let notification = core::events::notification_event(&event);
+        let notification = core::events::notification_event(
+            &state.database.pool,
+            state.database.driver == "mysql",
+            &event,
+        )
+        .await;
         let _ = state.plugins.publish_event(notification).await;
     }
     Ok(axum::Json(serde_json::json!({ "event": event })).into_response())
@@ -1837,19 +1924,55 @@ async fn automation_status(State(state): State<AppState>) -> Response {
             Ok(value) => value,
             Err(error) => return error.into_response(),
         };
-    let status = state.automation_status.lock().await;
+    let (running, last_run) = {
+        let status = state.automation_status.lock().await;
+        (status.running, status.last_run.clone())
+    };
+    let last_run = match last_run {
+        Some(last_run) => Some(last_run),
+        None => match core::automation_runs::list(&state.database.pool, 1, 0).await {
+            Ok(runs) => runs.into_iter().next().map(|run| {
+                serde_json::json!({
+                    "id":run.id,"runType":run.run_type,"startedAt":run.started_at,
+                    "completedAt":run.completed_at,"showsChecked":run.shows_checked,
+                    "storagesChecked":run.storages_checked,"candidatesFound":run.candidates_found,
+                    "eligibleCandidates":run.eligible_candidates,"eventsQueued":run.events_queued,
+                    "eventsProcessed":run.events_processed,"eventsFailed":run.events_failed,
+                    "errorCount":run.error_count,"storageLimitReached":run.storage_limit_reached,
+                    "historySaved":true,
+                })
+            }),
+            Err(error) => {
+                tracing::warn!(?error, "latest automation scan summary could not be loaded");
+                None
+            }
+        },
+    };
     axum::Json(serde_json::json!({
         "settings":settings.settings,
         "defaults":settings.defaults,
         "source":settings.source,
-        "running":status.running,
-        "lastRun":status.last_run,
+        "running":running,
+        "lastRun":last_run,
     }))
     .into_response()
 }
 
+async fn list_automation_runs(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<AutomationRunListQuery>,
+) -> Result<Response, core::automation_runs::AutomationRunError> {
+    let limit = query.limit.unwrap_or(100);
+    let offset = query.offset.unwrap_or(0);
+    let items = core::automation_runs::list(&state.database.pool, limit, offset).await?;
+    Ok(axum::Json(serde_json::json!({
+        "items":items,"limit":limit,"offset":offset,
+    }))
+    .into_response())
+}
+
 async fn automation_scan(State(state): State<AppState>) -> Response {
-    let result = run_automation_scan(&state, false, false).await;
+    let result = run_automation_scan(&state, false, false, "manual").await;
     axum::Json(result).into_response()
 }
 
@@ -2187,6 +2310,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/api/metadata/search", get(search_metadata))
         .route("/api/automation/status", get(automation_status))
+        .route("/api/automation/runs", get(list_automation_runs))
         .route("/api/automation/scan", axum::routing::post(automation_scan))
         .layer(DefaultBodyLimit::max(256 * 1024))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth));

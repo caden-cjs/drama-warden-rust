@@ -1,3 +1,4 @@
+pub mod automation_runs;
 pub mod episodes;
 pub mod events;
 pub mod followup;

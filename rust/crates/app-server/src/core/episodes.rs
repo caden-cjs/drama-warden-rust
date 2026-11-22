@@ -295,7 +295,7 @@ pub async fn list_episode_metadata(
     season_number: i64,
 ) -> Result<Vec<Value>, EpisodeError> {
     let rows = sqlx::query(
-        "SELECT e.episode_number, sem.name FROM show_episode e JOIN show_season s ON s.id = e.season_id JOIN show_episode_metadata sem ON sem.episode_id = e.id WHERE s.show_id = ? AND s.season_number = ? ORDER BY e.episode_number",
+        "SELECT e.episode_number, sem.name, sem.air_date FROM show_episode e JOIN show_season s ON s.id = e.season_id JOIN show_episode_metadata sem ON sem.episode_id = e.id WHERE s.show_id = ? AND s.season_number = ? ORDER BY e.episode_number",
     )
     .bind(show_id)
     .bind(season_number)
@@ -307,6 +307,7 @@ pub async fn list_episode_metadata(
             Ok(serde_json::json!({
                 "episodeNumber": row.try_get::<i64, _>("episode_number").map_err(EpisodeError::Database)?,
                 "name": optional_text(row, "name")?,
+                "airDate": optional_text(row, "air_date")?,
             }))
         })
         .collect()

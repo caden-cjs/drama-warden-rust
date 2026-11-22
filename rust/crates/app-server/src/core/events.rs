@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{AnyPool, Row};
 
+use crate::core::shows;
+
 #[derive(Debug)]
 pub enum EventError {
     Invalid(&'static str),
@@ -63,13 +65,28 @@ pub struct Event {
 
 /// Build the small, safe event envelope exposed to notification plugins.
 /// Stored payloads can contain share URLs and provider metadata, so only
-/// status and episode identifiers cross the plugin boundary.
-pub fn notification_event(event: &Event) -> Value {
+/// the show name, status, and episode identifiers cross the plugin boundary.
+pub async fn notification_event(pool: &AnyPool, mysql: bool, event: &Event) -> Value {
+    let show_name = match event.show_id {
+        Some(show_id) => shows::get(pool, show_id, mysql)
+            .await
+            .ok()
+            .flatten()
+            .map(|show| show.name),
+        None => None,
+    };
+    notification_event_with_show_name(event, show_name.as_deref())
+}
+
+fn notification_event_with_show_name(event: &Event, show_name: Option<&str>) -> Value {
     let mut payload = serde_json::Map::new();
     payload.insert("status".to_owned(), Value::String(event.status.clone()));
     payload.insert("kind".to_owned(), Value::String(event.kind.clone()));
     if let Some(show_id) = event.show_id {
         payload.insert("showId".to_owned(), Value::from(show_id));
+    }
+    if let Some(show_name) = show_name.map(str::trim).filter(|name| !name.is_empty()) {
+        payload.insert("showName".to_owned(), Value::String(show_name.to_owned()));
     }
     if let Some(season) = event.payload.get("seasonNumber").and_then(Value::as_i64) {
         payload.insert("seasonNumber".to_owned(), Value::from(season));
@@ -98,11 +115,11 @@ pub fn notification_event(event: &Event) -> Value {
 
 #[cfg(test)]
 mod notification_event_tests {
-    use super::{Event, notification_event};
+    use super::{Event, notification_event_with_show_name};
     use serde_json::json;
 
     #[test]
-    fn notification_event_contains_status_and_episode_ids_only() {
+    fn notification_event_contains_show_name_status_and_episode_ids_only() {
         let event = Event {
             id: 42,
             show_id: Some(7),
@@ -124,9 +141,10 @@ mod notification_event_tests {
             updated_at: "now".to_owned(),
         };
 
-        let notification = notification_event(&event);
+        let notification = notification_event_with_show_name(&event, Some("凡人修仙传"));
         assert_eq!(notification["type"], "workflow.event.status-changed");
         assert_eq!(notification["payload"]["status"], "processed");
+        assert_eq!(notification["payload"]["showName"], "凡人修仙传");
         assert_eq!(notification["payload"]["seasonNumber"], 2);
         assert_eq!(notification["payload"]["episodeNumbers"], json!([9]));
         assert!(!notification.to_string().contains("secret.invalid"));

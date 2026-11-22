@@ -125,6 +125,32 @@ fn episode_part(name: &str) -> Option<char> {
     }
 }
 
+fn release_air_date(name: &str) -> Option<String> {
+    let name = name.trim_start();
+    let bytes = name.as_bytes();
+    if bytes.len() >= 10
+        && bytes[..4].iter().all(u8::is_ascii_digit)
+        && matches!(bytes[4], b'-' | b'.' | b'_')
+        && bytes[7] == bytes[4]
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[8..10].iter().all(u8::is_ascii_digit)
+        && (bytes.len() == 10
+            || bytes[10].is_ascii_whitespace()
+            || matches!(bytes[10], b'_' | b'-' | b'.'))
+    {
+        return Some(format!("{}-{}-{}", &name[..4], &name[5..7], &name[8..10]));
+    }
+    if bytes.len() >= 9
+        && bytes[..8].iter().all(u8::is_ascii_digit)
+        && (bytes.len() == 8
+            || bytes[8].is_ascii_whitespace()
+            || matches!(bytes[8], b'_' | b'-' | b'.'))
+    {
+        return Some(format!("{}-{}-{}", &name[..4], &name[4..6], &name[6..8]));
+    }
+    None
+}
+
 fn metadata_episode_part(item: &Value) -> Option<(i64, i64)> {
     let name = item.get("name")?.as_str()?.to_ascii_lowercase();
     let start = name.find("episode ")? + "episode ".len();
@@ -155,7 +181,36 @@ pub fn selected_episode_number(name: &str, metadata_episodes: &[Value]) -> Optio
         .filter(|item| metadata_episode_part(item) == Some((issue_number, part_number)))
         .filter_map(|item| item.get("episodeNumber").and_then(positive_integer))
         .collect::<BTreeSet<_>>();
-    (matches.len() == 1).then(|| *matches.first().unwrap())
+    if matches.len() == 1 {
+        return matches.first().copied();
+    }
+
+    // Some metadata providers publish split variety episodes as generic
+    // "Episode N" entries. When a dated release file has an explicit 上/下
+    // marker and exactly two generic episodes aired that day, map the parts in
+    // episode order. This avoids treating preview/bonus cuts as aired episodes.
+    let date = release_air_date(name)?;
+    let dated = metadata_episodes
+        .iter()
+        .filter(|item| item.get("airDate").and_then(Value::as_str) == Some(date.as_str()))
+        .filter(|item| {
+            item.get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|title| {
+                    let mut words = title.split_whitespace();
+                    words.next() == Some("Episode")
+                        && words
+                            .next()
+                            .is_some_and(|number| number.parse::<i64>().is_ok())
+                        && words.next().is_none()
+                })
+        })
+        .filter_map(|item| item.get("episodeNumber").and_then(positive_integer))
+        .collect::<BTreeSet<_>>();
+    if dated.len() == 2 {
+        return dated.iter().nth((part_number - 1) as usize).copied();
+    }
+    None
 }
 
 fn digits_at(bytes: &[u8], mut index: usize) -> Option<i64> {
