@@ -257,12 +257,15 @@ pub async fn resolve_episode_manifest(
             .map(|(_, episode)| episode)
             .max()
             .unwrap_or(0);
-        let next_required = if current_season > 0 && current_season < season_number {
+        // Verify coverage through the latest known episode. Requiring the
+        // following episode marks a complete season as incomplete at its
+        // finale and blocks repairs to earlier missing episodes.
+        let baseline_required = if current_season > 0 && current_season < season_number {
             1
         } else {
-            current_episode.max(0) + 1
+            current_episode.max(1)
         };
-        let required_episode = observed.max(next_required);
+        let required_episode = observed.max(baseline_required);
         let sufficient = max_episode >= required_episode
             && coverage_gap_episode.is_none()
             && numbers.contains(&required_episode);
