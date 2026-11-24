@@ -5,6 +5,7 @@ pub mod followup;
 pub mod followup_plan;
 pub mod metadata;
 pub mod plugin_calls;
+pub mod plugin_health;
 pub mod runtime_settings;
 pub mod shows;
 pub mod subtitle_content;

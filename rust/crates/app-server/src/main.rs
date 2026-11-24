@@ -27,6 +27,7 @@ struct AppState {
     database: db::Database,
     api_token: String,
     plugins: plugins::PluginHost,
+    quark_auth_lock: std::sync::Arc<Mutex<()>>,
     runtime_updates: watch::Sender<core::runtime_settings::RuntimeSettings>,
     automation_status: std::sync::Arc<Mutex<AutomationStatus>>,
     subtitle_worker_status: std::sync::Arc<Mutex<core::subtitle_worker::WorkerStatus>>,
@@ -2081,7 +2082,156 @@ async fn monitor_plugin(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Response, plugins::PluginFailure> {
     let result = state.plugins.monitor(&id).await?;
+    if id == "quark" {
+        record_quark_authorization(&state, &result).await;
+    }
     Ok(axum::Json(serde_json::json!({ "result": result })).into_response())
+}
+
+async fn get_quark_auth_status(State(state): State<AppState>) -> Response {
+    let stored = match core::plugin_health::load_quark_authorization(&state.database.pool).await {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::error!(error = %error, "Quark authorization status read failed");
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "plugin_auth_status_failed",
+                "request failed",
+            );
+        }
+    };
+    let plugin = state
+        .plugins
+        .list()
+        .await
+        .into_iter()
+        .find(|plugin| plugin.id == "quark");
+    let enabled = plugin.as_ref().is_some_and(|plugin| plugin.enabled);
+    let configured = plugin.as_ref().is_some_and(|plugin| plugin.configured);
+    let active = plugin.as_ref().is_some_and(|plugin| plugin.active);
+    let mut response = serde_json::json!({
+        "pluginId":"quark",
+        "enabled":enabled,
+        "configured":configured,
+        "active":active,
+        "authorized":stored.authorized,
+        "checkedAt":stored.checked_at,
+    });
+    if stored.authorized == Some(false) {
+        response["errorCode"] = serde_json::json!("QUARK_AUTH_FAILED");
+    }
+    axum::Json(response).into_response()
+}
+
+async fn record_quark_authorization(state: &AppState, result: &serde_json::Value) {
+    let Some(authorized) = result.get("authorized").and_then(serde_json::Value::as_bool) else {
+        return;
+    };
+    let _guard = state.quark_auth_lock.lock().await;
+    let mysql = state.database.driver == "mysql";
+    let mut stored = match core::plugin_health::load_quark_authorization(&state.database.pool).await {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::error!(error = %error, "Quark authorization status read failed");
+            return;
+        }
+    };
+    let previous = stored.authorized;
+    let transition = core::plugin_health::authorization_transition(previous, authorized);
+    let checked_at = timestamp_utc();
+    stored.authorized = Some(authorized);
+    stored.checked_at = Some(checked_at.clone());
+    if previous.is_none() && authorized {
+        stored.last_notified_authorized = Some(true);
+    }
+    if let Err(error) = core::plugin_health::save_quark_authorization(
+        &state.database.pool,
+        mysql,
+        &stored,
+    )
+    .await
+    {
+        tracing::error!(error = %error, "Quark authorization status save failed");
+        return;
+    }
+
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    if !core::plugin_health::should_notify(&stored, now_unix) {
+        return;
+    }
+
+    stored.last_attempted_authorized = Some(authorized);
+    stored.last_attempt_at_unix = Some(now_unix);
+    if let Err(error) = core::plugin_health::save_quark_authorization(
+        &state.database.pool,
+        mysql,
+        &stored,
+    )
+    .await
+    {
+        tracing::error!(error = %error, "Quark authorization alert attempt could not be saved");
+        return;
+    }
+
+    let status = if authorized { "authorized" } else { "unauthorized" };
+    let message = if authorized {
+        "夸克网盘授权已恢复，转存功能可以继续使用。"
+    } else {
+        "夸克网盘授权已失效，转存任务会失败。请在 Docker 主机运行官方 CLI 登录并完成扫码，然后在插件页重新自检。"
+    };
+    let event = serde_json::json!({
+        "type":"plugin.authorization.status-changed",
+        "correlationId":format!("plugin-auth-quark-{checked_at}"),
+        "payload":{
+            "pluginId":"quark",
+            "pluginName":"夸克网盘",
+            "authorized":authorized,
+            "status":status,
+            "message":message,
+            "checkedAt":checked_at,
+        },
+    });
+    let outcomes = state.plugins.publish_event(event).await;
+    if outcomes
+        .iter()
+        .any(|outcome| outcome.get("ok").and_then(serde_json::Value::as_bool) == Some(true))
+    {
+        stored.last_notified_authorized = Some(authorized);
+        if let Err(error) = core::plugin_health::save_quark_authorization(
+            &state.database.pool,
+            mysql,
+            &stored,
+        )
+        .await
+        {
+            tracing::error!(error = %error, "Quark authorization notification receipt could not be saved");
+        }
+        tracing::info!(authorized, "Quark authorization state notification delivered");
+    } else {
+        tracing::warn!(authorized, ?transition, "Quark authorization state notification was not delivered");
+    }
+}
+
+async fn run_quark_auth_monitor(state: AppState) {
+    let mut interval = tokio::time::interval(Duration::from_secs(5 * 60));
+    loop {
+        interval.tick().await;
+        let active = state.plugins.list().await.into_iter().any(|plugin| {
+            plugin.id == "quark" && plugin.enabled && plugin.configured && plugin.active
+        });
+        if !active {
+            continue;
+        }
+        match state.plugins.monitor("quark").await {
+            Ok(result) => record_quark_authorization(&state, &result).await,
+            Err(error) => {
+                tracing::warn!(error_code = %error.code, "Quark authorization monitor failed");
+            }
+        }
+    }
 }
 
 async fn set_plugin_enabled(
@@ -2231,6 +2381,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         database,
         api_token,
         plugins,
+        quark_auth_lock: std::sync::Arc::new(Mutex::new(())),
         runtime_updates,
         automation_status: std::sync::Arc::new(Mutex::new(AutomationStatus::default())),
         subtitle_worker_status: subtitle_worker_status.clone(),
@@ -2243,6 +2394,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 .delete(reset_runtime_settings),
         )
         .route("/api/plugins", get(list_plugins))
+        .route("/api/plugins/quark/auth-status", get(get_quark_auth_status))
         .route(
             "/api/plugins/{id}/config",
             get(get_plugin_config)
@@ -2334,6 +2486,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let address = SocketAddr::new(host.parse()?, port);
     let listener = TcpListener::bind(address).await?;
     info!(address = %address, "drama-warden Rust backend listening");
+    tokio::spawn(run_quark_auth_monitor(state.clone()));
     tokio::spawn(run_scheduler(state.clone(), runtime_receiver));
     tokio::spawn(core::subtitle_worker::run_worker(
         state.database.pool.clone(),

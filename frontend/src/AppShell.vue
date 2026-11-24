@@ -37,7 +37,10 @@ const compactNavWidth = ref(73);
 const connectionState = ref('checking');
 const databaseState = ref('checking');
 const pendingCount = ref(null);
+const quarkAuthStatus = ref(null);
+const quarkAuthCheckBusy = ref(false);
 const naiveMessage = useMessage();
+let quarkAuthPollTimer = null;
 
 function readToken() {
   try {
@@ -102,6 +105,30 @@ async function saveToken(value) {
   await refreshConnection();
 }
 
+async function refreshQuarkAuthStatus() {
+  try {
+    quarkAuthStatus.value = await api.request('/api/plugins/quark/auth-status');
+  } catch {
+    quarkAuthStatus.value = null;
+  }
+}
+
+async function checkQuarkAuth() {
+  if (quarkAuthCheckBusy.value) return;
+  quarkAuthCheckBusy.value = true;
+  try {
+    const response = await api.request('/api/plugins/quark/monitor', { method: 'POST' });
+    await refreshQuarkAuthStatus();
+    if (response.result?.authorized === true) notify('夸克授权检查通过。');
+    else if (response.result?.authorized === false) notify('夸克授权仍未恢复，请完成官方 CLI 登录后再检查。', 'warning');
+    else notify('暂时无法确认夸克授权状态，请稍后重试。', 'warning');
+  } catch (error) {
+    notify(error.message || '夸克授权检查失败。', 'error');
+  } finally {
+    quarkAuthCheckBusy.value = false;
+  }
+}
+
 async function refreshConnection() {
   connectionState.value = 'checking';
   databaseState.value = 'checking';
@@ -118,10 +145,12 @@ async function refreshConnection() {
     ]);
     connectionState.value = 'ok';
     pendingCount.value = pending.items?.length ?? 0;
+    await refreshQuarkAuthStatus();
     return shows.items || [];
   } catch (error) {
     connectionState.value = error.status === 401 ? 'unauthorized' : 'error';
     pendingCount.value = null;
+    quarkAuthStatus.value = null;
     return null;
   }
 }
@@ -156,9 +185,15 @@ onMounted(() => {
   syncCompactNav();
   window.addEventListener('resize', syncCompactNav);
   refreshConnection();
+  quarkAuthPollTimer = window.setInterval(() => {
+    if (connectionState.value === 'ok') refreshQuarkAuthStatus();
+  }, 30000);
 });
 
-onBeforeUnmount(() => window.removeEventListener('resize', syncCompactNav));
+onBeforeUnmount(() => {
+  window.removeEventListener('resize', syncCompactNav);
+  if (quarkAuthPollTimer) window.clearInterval(quarkAuthPollTimer);
+});
 </script>
 
 <template>
@@ -220,6 +255,23 @@ onBeforeUnmount(() => window.removeEventListener('resize', syncCompactNav));
       </NLayoutHeader>
 
       <NLayoutContent class="page-frame" :native-scrollbar="false">
+        <div
+          v-if="quarkAuthStatus?.enabled && quarkAuthStatus?.configured && quarkAuthStatus?.active && quarkAuthStatus?.authorized === false"
+          class="inline-alert warning-alert quark-auth-banner"
+          role="alert"
+        >
+          <span class="alert-symbol">!</span>
+          <div class="quark-auth-copy">
+            <strong>夸克授权已失效</strong>
+            <p>在 Docker 项目目录运行 <code>docker compose exec drama-warden node /opt/quarkclouddrive/scripts/quark-drive.cjs login</code> 并完成扫码，然后点“立即自检”。</p>
+          </div>
+          <div class="quark-auth-actions">
+            <n-button class="button button-quiet button-small" attr-type="button" @click="activeView = 'plugins'">查看夸克插件</n-button>
+            <n-button class="button button-secondary button-small" attr-type="button" :disabled="quarkAuthCheckBusy" @click="checkQuarkAuth">
+              {{ quarkAuthCheckBusy ? '检查中…' : '立即自检' }}
+            </n-button>
+          </div>
+        </div>
         <component :is="currentComponent" :key="activeView" />
       </NLayoutContent>
     </NLayout>

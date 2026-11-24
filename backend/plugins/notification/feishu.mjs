@@ -6,6 +6,7 @@ const TERMINAL_STATUS = Object.freeze({
   skipped: { label: '追更已跳过', template: 'orange' },
   failed: { label: '追更失败', template: 'red' },
 });
+const PLUGIN_AUTH_EVENT = 'plugin.authorization.status-changed';
 const MARKDOWN_SPECIALS = new Set('\\`*_{}[]()#+-.!|>~');
 
 function pluginError(code) {
@@ -64,6 +65,33 @@ function formatStatusEvent(event = {}) {
     content: lines.join('\n'),
     template: status.template,
   };
+}
+
+function formatPluginAuthorizationEvent(event = {}) {
+  if (event.type !== PLUGIN_AUTH_EVENT) return null;
+  const payload = event.payload && typeof event.payload === 'object' && !Array.isArray(event.payload)
+    ? event.payload
+    : {};
+  const authorized = payload.authorized === true;
+  const pluginName = escapeMarkdown(payload.pluginName || payload.pluginId || '云盘插件');
+  const title = authorized ? `${pluginName}授权已恢复` : `${pluginName}授权失效`;
+  const lines = [
+    `**插件**：${pluginName}`,
+    `**状态**：${authorized ? '授权已恢复' : '授权失效'}`,
+  ];
+  if (authorized) {
+    lines.push('**结果**：转存功能可以继续使用。');
+  } else {
+    lines.push('**影响**：该网盘的转存任务会失败。');
+    lines.push('**处理**：在 Docker 项目目录运行 `docker compose exec drama-warden node /opt/quarkclouddrive/scripts/quark-drive.cjs login` 并完成扫码，然后在插件页重新自检。');
+  }
+  return { title: title.slice(0, 100), content: lines.join('\n'), template: authorized ? 'green' : 'orange' };
+}
+
+function formatNotificationEvent(event = {}) {
+  return event.type === PLUGIN_AUTH_EVENT
+    ? formatPluginAuthorizationEvent(event)
+    : formatStatusEvent(event);
 }
 
 export function createFeishuNotificationPlugin({
@@ -135,7 +163,7 @@ export function createFeishuNotificationPlugin({
   }
 
   async function notifyStatusEvent({ event } = {}) {
-    const message = formatStatusEvent(event);
+    const message = formatNotificationEvent(event);
     if (!message) return { ok: true, skipped: true };
     if (eventEndpoint) {
       const controller = new AbortController();
@@ -149,7 +177,7 @@ export function createFeishuNotificationPlugin({
               'content-type': 'application/json',
               ...(eventToken ? { authorization: `Bearer ${eventToken}` } : {}),
             },
-            body: JSON.stringify({ event: 'workflow.event.status-changed', ...event }),
+            body: JSON.stringify({ event: event.type, ...event }),
             signal: controller.signal,
           });
         } catch {
@@ -183,7 +211,7 @@ export function createFeishuNotificationPlugin({
     },
     actions: { notifyStatusEvent },
     capabilityDomains: { notifyStatusEvent: ['notification'] },
-    subscriptions: ['workflow.event.status-changed'],
+      subscriptions: ['workflow.event.status-changed', PLUGIN_AUTH_EVENT],
     async onEvent(event) {
       return notifyStatusEvent({ event });
     },
