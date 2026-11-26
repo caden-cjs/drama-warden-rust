@@ -678,6 +678,30 @@ pub async fn process_event(
     }
 }
 
+pub async fn fail_inactive_processing_events(
+    pool: &AnyPool,
+    mysql: bool,
+) -> Result<Vec<events::Event>, events::EventError> {
+    let processing = events::list(pool, Some("processing"), 1000, 0).await?;
+    let mut failed = Vec::new();
+    for event in processing
+        .into_iter()
+        .filter(|event| event.kind == "new_ep")
+    {
+        // This process-local guard distinguishes a live worker from a stale
+        // database state. Recovery and normal processing use the same guard.
+        let Ok(_active) = ActiveEvent::acquire(event.id) else {
+            continue;
+        };
+        match events::fail_abandoned_followup(pool, event.id, mysql).await {
+            Ok(event) => failed.push(event),
+            Err(events::EventError::Conflict(_)) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(failed)
+}
+
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RecoverRequest {
@@ -704,12 +728,7 @@ pub async fn recover_event(
             "confirm_no_active_worker_required",
         ));
     }
-    if ![
-        "complete",
-        "retry_after_review",
-        "discard_after_review",
-    ]
-    .contains(&input.action.as_str())
+    if !["complete", "retry_after_review", "discard_after_review"].contains(&input.action.as_str())
     {
         return Err(events::EventError::Invalid("invalid_recovery_action"));
     }
@@ -848,7 +867,10 @@ pub async fn recover_event(
         .map_err(recovery_error)?;
         expected.push((file.clone(), name.to_owned(), canonical, file_size, episode));
     }
-    if matches!(input.action.as_str(), "retry_after_review" | "discard_after_review") {
+    if matches!(
+        input.action.as_str(),
+        "retry_after_review" | "discard_after_review"
+    ) {
         let possible: HashSet<String> = expected
             .iter()
             .flat_map(|(_, name, canonical, _, _)| [name.clone(), canonical.clone()])

@@ -952,6 +952,53 @@ pub async fn finish_followup_failed(
     get(pool, event_id).await
 }
 
+pub async fn fail_abandoned_followup(
+    pool: &AnyPool,
+    event_id: i64,
+    mysql: bool,
+) -> Result<Event, EventError> {
+    let mut tx = pool.begin().await.map_err(EventError::Database)?;
+    let query = format!(
+        "SELECT kind, status FROM update_event WHERE id = ?{}",
+        if mysql { " FOR UPDATE" } else { "" }
+    );
+    let row = sqlx::query(&query)
+        .bind(event_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(EventError::Database)?
+        .ok_or(EventError::NotFound)?;
+    let kind = text(&row, "kind")?;
+    let status = text(&row, "status")?;
+    if kind != "new_ep" || status != "processing" {
+        return Err(EventError::Conflict("event_not_processing"));
+    }
+
+    let timestamp = if mysql {
+        "CURRENT_TIMESTAMP(3)"
+    } else {
+        "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
+    };
+    // The processing stage is not persisted, so assume a write may have started.
+    // Keep the episode claims uncertain until an operator reviews the destination.
+    sqlx::query(&format!("UPDATE show_episode_write_claim SET status='uncertain', updated_at={timestamp} WHERE event_id=? AND status='reserved'"))
+        .bind(event_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(EventError::Database)?;
+    let update = sqlx::query(&format!("UPDATE update_event SET status='failed', completed_at={timestamp}, updated_at={timestamp}, last_error=? WHERE id=? AND status='processing'"))
+        .bind("PROCESSING_INTERRUPTED: no active processor; review destination before retry")
+        .bind(event_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(EventError::Database)?;
+    if update.rows_affected() != 1 {
+        return Err(EventError::Conflict("event_not_processing"));
+    }
+    tx.commit().await.map_err(EventError::Database)?;
+    get(pool, event_id).await
+}
+
 pub async fn create(pool: &AnyPool, input: CreateEvent, mysql: bool) -> Result<Event, EventError> {
     let kind = input.kind.trim();
     let source = input.source.trim();
@@ -1106,7 +1153,7 @@ pub async fn queue_followup(
         } else {
             "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
         };
-        sqlx::query(&format!("UPDATE update_event SET status='skipped', completed_at={timestamp}, updated_at={timestamp} WHERE id=? AND status='pending'"))
+        sqlx::query(&format!("UPDATE update_event SET status='skipped', completed_at={timestamp}, updated_at={timestamp}, last_error='EPISODE_WRITE_CLAIMED' WHERE id=? AND status='pending'"))
             .bind(id).execute(&mut *tx).await.map_err(EventError::Database)?;
     }
     tx.commit().await.map_err(EventError::Database)?;

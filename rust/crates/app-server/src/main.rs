@@ -1400,6 +1400,21 @@ async fn run_automation_scan(
                                     == Some(true)
                                 {
                                     events_queued += 1;
+                                } else {
+                                    events_failed += 1;
+                                    if errors.len() < 100 {
+                                        let reason = result
+                                            .get("reason")
+                                            .and_then(serde_json::Value::as_str)
+                                            .unwrap_or("followup_not_queued");
+                                        errors.push(serde_json::json!({
+                                            "showId":show.id,
+                                            "storageId":storage.id,
+                                            "eventId":result.pointer("/event/id"),
+                                            "errorCode":reason.to_ascii_uppercase(),
+                                            "blocked":result.get("blocked"),
+                                        }));
+                                    }
                                 }
                                 // One enabled storage with an eligible candidate is enough for
                                 // this show. Trying the next provider would copy the same
@@ -1557,6 +1572,39 @@ async fn run_scheduler(
         if enabling {
             run_automation_scan(&state, true, settings.followup_auto_process, "scheduled").await;
         }
+    }
+}
+
+async fn recover_inactive_followup_events(state: &AppState) {
+    let mysql = state.database.driver == "mysql";
+    match core::followup::fail_inactive_processing_events(&state.database.pool, mysql).await {
+        Ok(events) => {
+            for event in events {
+                tracing::warn!(
+                    event_id = event.id,
+                    "inactive follow-up event marked failed for destination review"
+                );
+                let pool = state.database.pool.clone();
+                let plugins = state.plugins.clone();
+                tokio::spawn(async move {
+                    let notification = core::events::notification_event(&pool, mysql, &event).await;
+                    let _ = plugins.publish_event(notification).await;
+                });
+            }
+        }
+        Err(error) => {
+            tracing::error!(error = ?error, "inactive follow-up event recovery failed");
+        }
+    }
+}
+
+async fn run_followup_recovery_monitor(state: AppState) {
+    recover_inactive_followup_events(&state).await;
+    let mut interval = tokio::time::interval(Duration::from_secs(60));
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+        recover_inactive_followup_events(&state).await;
     }
 }
 
@@ -2124,12 +2172,16 @@ async fn get_quark_auth_status(State(state): State<AppState>) -> Response {
 }
 
 async fn record_quark_authorization(state: &AppState, result: &serde_json::Value) {
-    let Some(authorized) = result.get("authorized").and_then(serde_json::Value::as_bool) else {
+    let Some(authorized) = result
+        .get("authorized")
+        .and_then(serde_json::Value::as_bool)
+    else {
         return;
     };
     let _guard = state.quark_auth_lock.lock().await;
     let mysql = state.database.driver == "mysql";
-    let mut stored = match core::plugin_health::load_quark_authorization(&state.database.pool).await {
+    let mut stored = match core::plugin_health::load_quark_authorization(&state.database.pool).await
+    {
         Ok(value) => value,
         Err(error) => {
             tracing::error!(error = %error, "Quark authorization status read failed");
@@ -2144,12 +2196,8 @@ async fn record_quark_authorization(state: &AppState, result: &serde_json::Value
     if previous.is_none() && authorized {
         stored.last_notified_authorized = Some(true);
     }
-    if let Err(error) = core::plugin_health::save_quark_authorization(
-        &state.database.pool,
-        mysql,
-        &stored,
-    )
-    .await
+    if let Err(error) =
+        core::plugin_health::save_quark_authorization(&state.database.pool, mysql, &stored).await
     {
         tracing::error!(error = %error, "Quark authorization status save failed");
         return;
@@ -2165,18 +2213,18 @@ async fn record_quark_authorization(state: &AppState, result: &serde_json::Value
 
     stored.last_attempted_authorized = Some(authorized);
     stored.last_attempt_at_unix = Some(now_unix);
-    if let Err(error) = core::plugin_health::save_quark_authorization(
-        &state.database.pool,
-        mysql,
-        &stored,
-    )
-    .await
+    if let Err(error) =
+        core::plugin_health::save_quark_authorization(&state.database.pool, mysql, &stored).await
     {
         tracing::error!(error = %error, "Quark authorization alert attempt could not be saved");
         return;
     }
 
-    let status = if authorized { "authorized" } else { "unauthorized" };
+    let status = if authorized {
+        "authorized"
+    } else {
+        "unauthorized"
+    };
     let message = if authorized {
         "夸克网盘授权已恢复，转存功能可以继续使用。"
     } else {
@@ -2200,18 +2248,22 @@ async fn record_quark_authorization(state: &AppState, result: &serde_json::Value
         .any(|outcome| outcome.get("ok").and_then(serde_json::Value::as_bool) == Some(true))
     {
         stored.last_notified_authorized = Some(authorized);
-        if let Err(error) = core::plugin_health::save_quark_authorization(
-            &state.database.pool,
-            mysql,
-            &stored,
-        )
-        .await
+        if let Err(error) =
+            core::plugin_health::save_quark_authorization(&state.database.pool, mysql, &stored)
+                .await
         {
             tracing::error!(error = %error, "Quark authorization notification receipt could not be saved");
         }
-        tracing::info!(authorized, "Quark authorization state notification delivered");
+        tracing::info!(
+            authorized,
+            "Quark authorization state notification delivered"
+        );
     } else {
-        tracing::warn!(authorized, ?transition, "Quark authorization state notification was not delivered");
+        tracing::warn!(
+            authorized,
+            ?transition,
+            "Quark authorization state notification was not delivered"
+        );
     }
 }
 
@@ -2487,6 +2539,8 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(address).await?;
     info!(address = %address, "drama-warden Rust backend listening");
     tokio::spawn(run_quark_auth_monitor(state.clone()));
+    recover_inactive_followup_events(&state).await;
+    tokio::spawn(run_followup_recovery_monitor(state.clone()));
     tokio::spawn(run_scheduler(state.clone(), runtime_receiver));
     tokio::spawn(core::subtitle_worker::run_worker(
         state.database.pool.clone(),
